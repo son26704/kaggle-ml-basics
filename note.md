@@ -1,432 +1,446 @@
-Rất tốt. Với notebook log mới này, bạn đã đi tới một mốc quan trọng hơn trước:
+Đọc cả firmware và notebook mới, tôi thấy vấn đề chính không phải là “PPG không dùng được”, mà là:
 
-## Bạn đã có được “profile-quality-power map” sơ bộ
+> **logic scheduler trên firmware hiện tại chưa tương thích với logic mà notebook đã chứng minh offline.**
 
-Và từ đó đã rút ra được một quyết định hệ thống ban đầu:
+Cụ thể, firmware adaptive đang dùng:
 
-* **50sps_med / good** đang là điểm cân bằng đẹp nhất
-* **100sps_med / good** cho difficulty thấp hơn nhưng power cao hơn
-* **25sps_low / good** tiết kiệm điện nhưng chất lượng chưa đủ ổn
-* các run `bad` cho thấy quality/difficulty tách được khá rõ giữa các profile
+* window theo **số mẫu cố định** `SCHED_WINDOW_SAMPLES = 200`
+* quality/difficulty tính chỉ từ **raw std + raw ptp**
+* rule chuyển state chỉ có **2 state: normal/high**
+* threshold cố định `SCHED_STD_MIN`, `SCHED_PTP_MIN`, `SCHED_DIFF_HARD`, `SCHED_DIFF_EASY` 
+
+Trong khi notebook offline của bạn kết luận tốt hơn dựa trên:
+
+* window **8 giây, stride 2 giây**
+* quality gate có `ir_raw_ptp`, `peak_rate_per_sec`, `ac_best`, `spectral_entropy`
+* difficulty proxy dùng `hr_est_std`, `ac_best`, `spectral_entropy`
+* policy chọn 50 ↔ 100 dựa trên các tín hiệu đó
+
+Hai thế giới này hiện đang **không cùng bài toán**.
+
+---
+
+# 1) Vấn đề lớn nhất hiện tại là gì?
+
+Tôi thấy có 3 vấn đề cốt lõi.
+
+## Vấn đề A — Firmware dùng proxy “quá nghèo”
+
+Trong code hiện tại, `scheduler_compute_window_metrics()` chỉ dùng:
+
+* `std`
+* `ptp`
+
+để ra:
+
+* `quality_pass`
+* `difficulty_proxy`
+
+và difficulty được định nghĩa gần như:
+
+* biên độ càng thấp → càng khó 
+
+Điều này giải thích rất hợp lý kết quả “không ổn”:
+
+* **good** có thể bị đẩy sang `100sps_med` quá nhiều nếu biên độ hơi thấp
+* **bad** có thể vẫn ở `50sps_med` nếu biên độ lớn nhưng tín hiệu thực ra nhiễu/méo
+
+Mà notebook của bạn đã chỉ ra đúng điều đó từ dữ liệu thật:
+
+* bad windows có `ir_raw_ptp` rất lớn
+* nhưng `ac_best` thấp
+* quality kém vì **chu kỳ xấu**, không phải vì biên độ nhỏ
 
 Nói ngắn gọn:
 
-> Bạn đã có đủ dữ liệu để bắt đầu thiết kế **policy scheduler version 1**.
+> bad signal của bạn thường là **to nhưng xấu**, còn firmware hiện tại lại đang coi “to” là tốt.
+
+Đây là nguyên nhân số 1.
 
 ---
 
-# 1) Tôi đọc kết quả mới của bạn như thế nào
+## Vấn đề B — Window firmware không cùng nghĩa với window notebook
 
-## Sampling / logging
-
-Các file giờ đã sạch hơn hẳn:
-
-* 8 file log riêng
-* mỗi file chỉ có **1 profile_id**
-* `fs_est_hz` khớp đúng:
-
-  * 25 Hz
-  * 50 Hz
-  * 25 Hz cho hai profile 100sps* trong log hiện tại
-
-Điểm cuối này rất đáng chú ý:
-
-### Có khả năng tên profile và cấu hình thực tế chưa khớp
-
-Trong bảng summary của bạn:
-
-* `100sps_high`
-* `100sps_med`
-
-nhưng `fs_est_hz` hiện ra là **25.0 Hz**
-
-Điều này gợi ý một trong hai khả năng:
-
-1. **Tên file/profile_name đang không khớp với cấu hình MAX30102 thực tế**
-2. hoặc `spo2_config` trong firmware chưa set đúng như bạn nghĩ
-
-Đây là việc cần kiểm tra ngay ở vòng sau, vì nếu bạn tin là đang đo 100 sps nhưng log thực tế chỉ 25 Hz thì toàn bộ phần scheduler sẽ bị lệch.
-
----
-
-# 2) Ý nghĩa của bảng quality map hiện tại
-
-Từ bảng bạn có:
-
-## Good-condition
-
-* `50sps_med_good`
-
-  * quality_pass_ratio = **1.00**
-  * avg_power ≈ **15.82 mW**
-  * difficulty ≈ **0.408**
-* `100sps_med_good`
-
-  * quality_pass_ratio = **1.00**
-  * avg_power ≈ **19.70 mW**
-  * difficulty ≈ **0.275**
-* `100sps_high_good`
-
-  * quality_pass_ratio = **1.00**
-  * avg_power ≈ **22.51 mW**
-  * difficulty ≈ **0.546**
-* `25sps_low_good`
-
-  * quality_pass_ratio = **0.84**
-  * avg_power ≈ **16.89 mW**
-  * difficulty ≈ **0.702**
-
-## Cách đọc
-
-* `25sps_low` tiết kiệm điện nhưng quality/difficulty đang kém rõ rệt
-* `50sps_med` đang rất đẹp: **quality 1.0, power thấp nhất trong các cấu hình đạt quality tốt**
-* `100sps_med` có difficulty thấp hơn nữa nhưng tiêu thụ điện cao hơn
-* `100sps_high` không đáng tiền nếu power cao mà difficulty không cải thiện tương ứng
-
-### Kết luận hệ thống đầu tiên
-
-Ở trạng thái bình thường:
-
-* **50sps_med nên là base profile**
-  không phải 25sps_low
-
-Đây là một phát hiện rất quan trọng.
-
----
-
-# 3) Điều này có nghĩa gì cho đề tài của bạn
-
-Giờ đề tài của bạn đã không còn mơ hồ nữa.
-Bạn đã có thể phát biểu nó thành một pipeline rõ ràng:
-
-## Baseline system
-
-* profile cố định `50sps_med`
-* thu PPG liên tục
-* trích feature
-* suy luận difficulty/quality định kỳ
-
-## Adaptive system
-
-* khi tín hiệu dễ/ổn → giữ `50sps_med` hoặc hạ xuống `25sps_low`
-* khi tín hiệu khó/xấu → nâng lên `100sps_med`
-* tránh dùng `100sps_high` vì power cao mà chưa cho lợi ích xứng đáng
-
-Tức là scheduler v1 có thể là:
-
-* **easy** → `25sps_low`
-* **normal** → `50sps_med`
-* **hard** → `100sps_med`
-
-và **bỏ `100sps_high`** khỏi phiên bản đầu.
-
----
-
-# 4) Bước tiếp theo nên làm gì
-
-Bây giờ không nên quay lại sửa model, mà nên làm 3 bước sau theo đúng thứ tự.
-
----
-
-## Bước 1 — xác minh profile config trong firmware
-
-Đây là việc phải làm ngay.
-
-Vì notebook cho thấy:
-
-* tên profile `100sps_*`
-* nhưng `fs_est_hz = 25.0`
-
-Bạn cần kiểm tra lại trong firmware:
-
-* `PROFILE_25SPS_LOW`
-* `PROFILE_50SPS_MED`
-* `PROFILE_100SPS_MED`
-* `PROFILE_100SPS_HIGH`
-
-đặc biệt là byte `spo2_config`
-
-### Việc cần làm
-
-Sau khi apply profile, hãy đọc lại thanh ghi:
-
-* `REG_SPO2_CONFIG`
-* `REG_FIFO_CONFIG`
-* `REG_LED1_PA`
-* `REG_LED2_PA`
-
-và in ra log.
-
-### Thêm hàm debug
-
-Bạn nên thêm một hàm như:
+Firmware dùng:
 
 ```c
-static void max30102_dump_profile_regs(const char *name)
-{
-    uint8_t fifo_cfg = 0, spo2_cfg = 0, led1 = 0, led2 = 0, mode = 0;
-    max30102_read_reg(REG_FIFO_CONFIG, &fifo_cfg);
-    max30102_read_reg(REG_SPO2_CONFIG, &spo2_cfg);
-    max30102_read_reg(REG_LED1_PA, &led1);
-    max30102_read_reg(REG_LED2_PA, &led2);
-    max30102_read_reg(REG_MODE_CONFIG, &mode);
-
-    ESP_LOGI(TAG,
-             "[%s] FIFO=0x%02X SPO2=0x%02X LED1=0x%02X LED2=0x%02X MODE=0x%02X",
-             name, fifo_cfg, spo2_cfg, led1, led2, mode);
-}
+#define SCHED_WINDOW_SAMPLES 200U
 ```
 
-Và gọi ngay sau `max30102_apply_profile()`.
+Nghĩa là:
 
-### Mục tiêu
+* nếu profile đang là 50 sps → window khoảng 4 giây
+* nếu là 100 sps → window khoảng 2 giây
+* nếu fs thực tế lệch, thời lượng window lại khác nữa 
 
-Xác nhận rằng profile bạn nghĩ là 100 sps **thật sự** là 100 sps.
+Trong khi notebook đang phân tích với:
+
+* **8 giây / stride 2 giây**
+
+Nên threshold offline bạn chọn:
+
+* không thể bê thẳng sang firmware được
+
+Vì firmware đang ra quyết định trên cửa sổ **ngắn hơn rất nhiều**.
 
 ---
 
-## Bước 2 — thu thêm log lặp lại để có độ tin cậy
+## Vấn đề C — Adaptive log on-device đang cho thấy policy chưa tốt hơn baseline
 
-Hiện tại mỗi tổ hợp mới có:
+Kết quả notebook của bạn cho thấy:
 
-* 1 file good
-* 1 file bad
+* **adaptive / good**:
 
-Như vậy vẫn hơi ít.
+  * quality pass chỉ ~0.9167
+  * power ~17.87 mW
+* trong khi **fixed_50 / good**:
 
-### Bạn nên thu tiếp:
+  * quality pass = 1.0
+  * power ~16.22 mW
 
-Mỗi profile:
+Tức là ở điều kiện tốt:
 
-* 3 run `good`
-* 3 run `bad`
+* adaptive đang **tệ hơn fixed_50 cả về quality lẫn power**
 
-Tối thiểu cho 3 profile:
+Đây là dấu hiệu rất mạnh rằng:
 
-* `25sps_low`
+> policy hiện tại chưa nên đưa vào “kết quả cuối”, mà phải quay lại hiệu chỉnh.
+
+---
+
+# 2) Chẩn đoán chính xác hơn từ kết quả của bạn
+
+Từ notebook hiện tại, có mấy tín hiệu rất rõ:
+
+## Với data thật
+
+* good:
+
+  * `ac_best` cao
+  * `ir_raw_ptp` nhỏ vừa phải
+* bad:
+
+  * `ir_raw_ptp` rất lớn
+  * `ac_best` thấp
+
+Điều này nói rằng:
+
+* **amplitude lớn không có nghĩa là quality tốt**
+* ngược lại, PPG đẹp thường có:
+
+  * chu kỳ rõ (`ac_best`)
+  * peak rate hợp lý
+  * entropy không quá méo
+
+Firmware hiện tại chưa dùng các yếu tố đó.
+
+## Adaptive occupancy hiện tại
+
+* good: phần lớn thời gian ở `high(100sps)` ~88%
+* bad: phần lớn thời gian ở `normal(50sps)` ~91%
+
+Đây gần như là **ngược kỳ vọng**.
+
+Điều đó xác nhận rằng rule hiện tại đang “đọc sai bản chất” của tín hiệu.
+
+---
+
+# 3) Hướng đi đúng bây giờ
+
+Bạn **không nên** cố vá threshold cũ mãi.
+
+Bạn nên đổi chiến lược sang:
+
+## Giai đoạn kế tiếp = “Firmware policy v1.5”
+
+với mục tiêu:
+
+* vẫn chỉ dùng **feature đơn giản**
+* nhưng phải **đồng pha với notebook hơn**
+
+Tôi khuyên chia làm 2 bước.
+
+---
+
+# 4) Bước sửa firmware quan trọng nhất: thêm `ac_best` hoặc một proxy tuần hoàn đơn giản
+
+Nếu chỉ giữ `std` + `ptp`, bạn sẽ tiếp tục bị lẫn giữa:
+
+* biên độ lớn do nhiễu
+* biên độ lớn do PPG tốt
+
+Cần thêm một chỉ số tuần hoàn.
+
+## Tối thiểu nên thêm 1 trong 2 cái:
+
+### Cách 1 — thêm `ac_best` gần đúng
+
+Tính autocorrelation normalized trên IR window, rồi lấy đỉnh tốt nhất trong dải HR hợp lý.
+
+Đây là cách gần nhất với notebook, và là lựa chọn tôi khuyên.
+
+### Cách 2 — nếu chưa muốn autocorr đầy đủ
+
+Dùng một proxy đơn giản hơn:
+
+* số peak hợp lệ
+* peak interval variance
+* hoặc zero-crossing / periodicity score
+
+Nhưng về lâu dài, `ac_best` vẫn là đẹp nhất.
+
+---
+
+# 5) Policy firmware nên sửa thành gì
+
+Hiện tại bạn có 2 state:
+
 * `50sps_med`
 * `100sps_med`
 
-Tổng:
+Giữ 2 state là đúng.
+**Đừng đưa 25sps_low vào adaptive on-device lúc này.**
 
-* 18 file
+## Policy v1.5 tôi khuyên
 
-Như vậy bạn mới có thể báo cáo:
+Default vẫn là `50sps_med`.
 
-* mean ± std của power
-* mean ± std của quality_pass_ratio
-* mean ± std của difficulty
+### Upshift sang `100sps_med` nếu:
 
-### Vì sao cần vậy
+* `quality_pass == 0`
+* hoặc `ac_best < AC_LOW`
+* hoặc `difficulty_proxy > HARD_T`
 
-Hiện tại một run có thể bị ảnh hưởng bởi:
+### Downshift về `50sps_med` nếu:
 
-* cách đặt tay
-* thời điểm đo
-* transient nhỏ
-* ngẫu nhiên môi trường
+* `quality_pass == 1`
+* và `ac_best > AC_HIGH`
+* và điều này giữ liên tiếp `N` window
 
-Bạn cần 3 run để tránh kết luận từ một mẫu đơn lẻ.
+### Hysteresis
 
----
-
-## Bước 3 — xây “profile selection policy” v1 trong notebook
-
-Sau khi có 18 file, bạn sẽ không chỉ mô tả bảng nữa, mà chốt policy.
-
-### Policy v1 tôi đề xuất
-
-* nếu `quality_pass_ratio` tốt và `difficulty_score_norm < T1` → dùng `25sps_low`
-* nếu ở vùng trung gian → dùng `50sps_med`
-* nếu `difficulty_score_norm > T2` hoặc fail gate → dùng `100sps_med`
-
-### Nhưng ở thời điểm hiện tại
-
-Với dữ liệu bạn đang có, policy v1 thực dụng hơn là:
-
-* **Default = 50sps_med**
-* nếu `difficulty` rất thấp và quality ổn định liên tục nhiều window → thử hạ xuống `25sps_low`
-* nếu `difficulty` cao hoặc fail gate → nâng lên `100sps_med`
-
-Điểm này rất quan trọng:
-
-> Đừng dùng `25sps_low` làm default nữa.
+* lên nhanh: 1 window fail là đủ
+* xuống chậm: cần 3–4 window tốt liên tiếp
 
 ---
 
-# 5) Bước sau nữa: mô phỏng scheduler trên log thật
+# 6) Sửa “difficulty_proxy” thế nào
 
-Bây giờ bạn đã có nhiều profile riêng, nên mô phỏng scheduler trên log thật sẽ có ý nghĩa hơn.
+Tôi khuyên bỏ công thức hiện tại kiểu:
 
-## Ý tưởng
+* std_score + ptp_score → difficulty
 
-Dùng dữ liệu log thật để giả lập state machine:
+và thay bằng công thức nhẹ hơn nhưng hợp lý hơn:
 
-* State L: `25sps_low`
-* State M: `50sps_med`
-* State H: `100sps_med`
+## Gợi ý công thức mới
 
-và rule:
+```text
+difficulty = w1 * normalized_hr_variability
+           + w2 * (1 - ac_best)
+           + w3 * saturation_or_instability_score
+```
 
-* quality tốt liên tiếp N window → hạ state
-* difficulty cao hoặc fail gate → nâng state
+Nếu chưa có HR variability on-device, bản tối giản là:
 
-### Mục tiêu
+```text
+difficulty = 0.7 * (1 - ac_best) + 0.3 * low_amplitude_penalty
+```
 
-Ước lượng:
+Trong đó:
 
-* phần trăm thời gian ở mỗi state
-* power trung bình nếu dùng policy này
-* so với baseline fixed `50sps_med`
-* quality pass ratio còn giữ được bao nhiêu
+* `low_amplitude_penalty` chỉ là phần phụ
+* yếu tố chính là `ac_best`
 
-Đây chính là bước “scheduler simulation on real logs”.
-
----
-
-# 6) Bạn nên thêm cell gì tiếp theo trong notebook
-
-Bây giờ tôi khuyên thêm 3 cell mới.
+Vì từ log thật của bạn, yếu tố tách tốt nhất giữa good/bad là **periodicity**, không phải amplitude.
 
 ---
 
-## Cell A — loại `100sps_high` khỏi policy analysis
+# 7) Bước notebook tiếp theo nên làm gì
+
+Trước khi sửa firmware lớn, bạn nên thêm một thí nghiệm trong notebook:
+
+## So sánh “proxy firmware cũ” với “proxy firmware mới”
+
+Tạo 2 cột:
+
+* `difficulty_old_fw_like`
+  = chỉ từ `ir_raw_std`, `ir_raw_ptp`
+
+* `difficulty_new_fw_like`
+  = từ `ac_best` + `ir_raw_ptp` nhẹ
+
+rồi so:
+
+* correlation với `condition`
+* correlation với `quality_pass`
+* correlation với `difficulty_score_norm` hiện tại
+
+Mục tiêu là kiểm chứng trước trên notebook:
+
+* proxy nào phân tách good/bad tốt hơn
+
+---
+
+## Cell nên thêm ngay
 
 ```python
-policy_df = quality_df[quality_df["profile_name"].isin(["25sps_low", "50sps_med", "100sps_med"])].copy()
-
-display(
-    policy_df.groupby(["profile_name", "condition"]).agg(
-        windows=("quality_pass", "size"),
-        quality_pass_ratio=("quality_pass", "mean"),
-        avg_power_mw=("power_mw_mean", "mean"),
-        difficulty_mean=("difficulty_score_norm", "mean"),
-        ac_best_mean=("ac_best", "mean"),
-        ir_ptp_mean=("ir_raw_ptp", "mean"),
-    ).reset_index()
+quality_df["difficulty_old_fw_like"] = 1.0 - 0.5 * (
+    np.clip(quality_df["ir_raw_std"] / 4000.0, 0, 1) +
+    np.clip(quality_df["ir_raw_ptp"] / 12000.0, 0, 1)
 )
+
+quality_df["difficulty_new_fw_like"] = (
+    0.7 * (1.0 - np.clip(quality_df["ac_best"], 0, 1)) +
+    0.3 * (1.0 - np.clip(quality_df["ir_raw_ptp"] / 6000.0, 0, 1))
+)
+
+cmp = quality_df.groupby("condition")[[
+    "difficulty_old_fw_like",
+    "difficulty_new_fw_like",
+    "difficulty_score_norm",
+    "ac_best",
+    "ir_raw_ptp"
+]].agg(["mean", "std"])
+
+display(cmp)
 ```
+
+Nếu `difficulty_new_fw_like` tách good/bad rõ hơn, đó là bằng chứng để sửa firmware.
 
 ---
 
-## Cell B — ranking lại 3 profile chính
+# 8) Sửa firmware cụ thể theo mức độ
 
-```python
-decision3_df = policy_df.groupby(["profile_name", "condition"]).agg(
-    quality_pass_ratio=("quality_pass", "mean"),
-    avg_power_mw=("power_mw_mean", "mean"),
-    difficulty_mean=("difficulty_score_norm", "mean"),
-    windows=("quality_pass", "size"),
-).reset_index()
+## Mức 1 — ít sửa nhất
 
-good_rank3 = decision3_df[decision3_df["condition"] == "good"].sort_values(
-    ["quality_pass_ratio", "avg_power_mw", "difficulty_mean"],
-    ascending=[False, True, True]
-).reset_index(drop=True)
+Giữ toàn bộ structure hiện tại, chỉ thay:
 
-bad_rank3 = decision3_df[decision3_df["condition"] == "bad"].sort_values(
-    ["quality_pass_ratio", "difficulty_mean", "avg_power_mw"],
-    ascending=[False, True, True]
-).reset_index(drop=True)
+* `scheduler_compute_window_metrics()`
+* threshold
+* downshift hysteresis
 
-print("=== Good ranking (3 profiles) ===")
-display(good_rank3)
+### Cần làm
 
-print("=== Bad robustness ranking (3 profiles) ===")
-display(bad_rank3)
-```
+* thêm buffer 200 mẫu IR
+* tính `ac_best`
+* quality pass = (`ac_best > ngưỡng`) AND (`ptp > ngưỡng tối thiểu`)
+
+Đây là bản tôi khuyên làm ngay.
 
 ---
 
-## Cell C — policy v1 đề xuất
+## Mức 2 — sửa đúng hơn nữa
 
-```python
-def suggest_policy_v1(row):
-    if row["condition"] == "good":
-        if row["profile_name"] == "50sps_med":
-            return "default_profile"
-        elif row["profile_name"] == "25sps_low":
-            return "candidate_low_power_only_if_stable"
-        elif row["profile_name"] == "100sps_med":
-            return "candidate_high_fidelity_when_hard"
-    return "reference"
+Đổi:
 
-policy_suggestion_df = decision3_df.copy()
-policy_suggestion_df["suggestion"] = policy_suggestion_df.apply(suggest_policy_v1, axis=1)
-
-display(policy_suggestion_df.sort_values(["condition", "profile_name"]).reset_index(drop=True))
+```c
+SCHED_WINDOW_SAMPLES = 200
 ```
 
----
-
-# 7) Bước firmware tiếp theo sau khi xác minh profile đúng
-
-Sau khi bạn sửa và xác minh profile config:
-
-## Firmware v1.1
-
-* giữ logger như hiện tại
-* nhưng thêm:
-
-  * dump register sau apply profile
-  * option chọn profile compile-time
-  * không sweep
+thành window theo **thời gian**, không theo số mẫu.
 
 Ví dụ:
 
-```c
-#define ACTIVE_PROFILE_INDEX 1   // 0=25sps_low, 1=50sps_med, 2=100sps_med
-```
+* normal 50 sps → 8 giây = 400 mẫu
+* high 100 sps → 8 giây = 800 mẫu
 
-Rồi build riêng từng profile.
+Như vậy firmware mới đồng nghĩa với notebook.
 
-Như vậy notebook sẽ nhận log sạch hơn nữa.
+### Nhưng:
 
----
-
-# 8) Khi nào mới viết scheduler on-device?
-
-Bạn chỉ nên viết scheduler on-device khi đủ 3 điều kiện:
-
-1. profile config đã xác minh đúng
-2. có ít nhất 3 run / condition / profile
-3. notebook đã cho ra policy v1 rõ ràng
-
-Hiện tại bạn mới hoàn thành điều kiện số 1 một nửa và số 2 chưa đủ.
+Cái này sửa nhiều hơn, nên tôi xếp sau Mức 1.
 
 ---
 
-# 9) Tôi chốt bước tiếp theo ngay bây giờ
+# 9) Lộ trình sửa cụ thể tôi khuyên
 
-## Việc phải làm ngay
+## Vòng sửa 1
 
-1. **Kiểm tra lại `spo2_config` thật sự của các profile 100sps**
-2. **Thu thêm 2 run nữa cho mỗi tổ hợp profile-condition**
-3. **Bỏ `100sps_high` khỏi policy v1**
-4. **Dùng notebook để chốt 3-state policy: 25 / 50 / 100 med**
+1. Giữ 2-state: `50 ↔ 100`
+2. Bỏ `std+ptp-only`
+3. Thêm `ac_best`
+4. quality gate mới:
 
-## Việc chưa nên làm
+   * `ptp > min_ptp`
+   * `ac_best > min_ac`
+5. downshift chậm hơn:
 
-* chưa port model lên ESP32
-* chưa viết scheduler runtime đầy đủ
-* chưa kết luận profile 100sps_* tốt/xấu trước khi xác minh sample rate thật
+   * từ 2 window lên **3 hoặc 4 window**
+6. cooldown sau switch:
+
+   * tăng lên **2 window**
+
+## Vòng sửa 2
+
+7. nếu vẫn chưa ổn, mới đổi window thành 8 giây thực
+8. so lại fixed_50 vs adaptive_v1.5
 
 ---
 
-# 10) Chốt chiến lược
+# 10) Kết quả bạn nên hướng tới sau lần sửa tới
 
-Từ dữ liệu hiện tại, tôi khuyên bạn chốt hướng như sau:
+Tôi không kỳ vọng adaptive sẽ thắng mọi metric.
+Mục tiêu hợp lý hơn là:
 
-* **Baseline profile:** `50sps_med`
-* **Low-power candidate:** `25sps_low`
-* **High-fidelity candidate:** `100sps_med`
-* **Discard for v1:** `100sps_high`
+## Điều kiện good
 
-và bước kế tiếp là:
+* quality gần fixed_50
+* power không cao hơn fixed_50 quá nhiều
+* ideally thấp hơn hoặc ngang
 
-> **xác minh lại cấu hình sampling thực của từng profile và mở rộng số run để policy v1 có độ tin cậy.**
+## Điều kiện bad
 
-Nếu bạn muốn, ở tin nhắn tiếp theo tôi sẽ viết luôn cho bạn:
+* quality tốt hơn fixed_50
+* power thấp hơn fixed_100
 
-* **đoạn code firmware để dump register profile sau apply**
-* và **các cell notebook để tổng hợp mean ± std theo nhiều run và chốt policy v1 bằng bảng cuối cùng cho báo cáo**.
+Nếu đạt được như vậy, adaptive đã có giá trị.
+
+---
+
+# 11) Chốt: bước tiếp theo nên làm gì
+
+Tôi khuyên bạn làm theo đúng thứ tự này:
+
+### Việc 1
+
+Trong notebook, tạo và so sánh:
+
+* `difficulty_old_fw_like`
+* `difficulty_new_fw_like`
+
+### Việc 2
+
+Sửa firmware:
+
+* thêm `ac_best` hoặc periodicity proxy tương đương
+* tăng `downshift_good_windows`
+* tăng `cooldown_windows`
+
+### Việc 3
+
+Thu lại 3 chế độ:
+
+* fixed_50
+* fixed_100
+* adaptive_v1.5
+
+### Việc 4
+
+Chạy lại notebook và so:
+
+* adaptive vs fixed_50
+* adaptive vs fixed_100
+
+---
+
+# 12) Kết luận ngắn gọn
+
+Hiện tại “chưa ổn” là vì:
+
+* firmware đang dùng **proxy sai bản chất**
+* notebook cho thấy **quality phụ thuộc periodicity**, không chỉ amplitude
+* adaptive hiện đang **upshift sai chỗ và downshift sai chỗ**
+
+Hướng sửa đúng là:
+
+> **thay amplitude-only gate bằng periodicity-aware gate**, rồi chạy lại adaptive.
