@@ -1,362 +1,297 @@
-﻿# Phần B: Tối ưu hóa năng lượng và tích hợp TinyML điều phối thích nghi
+﻿# PHẦN B. TỐI ƯU HÓA NĂNG LƯỢNG VÀ TÍCH HỢP TINYML CHO BỘ ĐIỀU PHỐI THÍCH NGHI
 
-## 1. Đặt lại bài toán sau Phần A
+## 1. Giới thiệu
 
-Sau Phần A, prototype đã chứng minh được ba điều kiện tiên quyết: ESP32-S3 đọc được dữ liệu quang từ MAX30102, INA219 ghi được telemetry năng lượng, và BPM cơ bản có thể suy ra từ tín hiệu PPG trong điều kiện nghỉ. Tuy nhiên, chính lúc chuyển từ “đọc được tín hiệu” sang “đo được một hệ thống đeo thực tế” thì các giới hạn kỹ thuật mới lộ ra rõ ràng.
+Nếu Phần A tập trung vào việc xây dựng một prototype phần cứng có khả năng thu tín hiệu PPG ổn định và đo được công suất của toàn node, thì Phần B chuyển trọng tâm sang bài toán ở mức hệ thống: làm thế nào để node không phải luôn chạy ở cấu hình mạnh, nhưng vẫn duy trì được khả năng theo dõi nhịp tim trong những điều kiện tín hiệu khó.
 
-Giới hạn thứ nhất là **độ bền vững của DSP-only**. Peak detection và autocorrelation cho kết quả hợp lý khi ngón tay giữ yên, nhưng nhanh chóng suy giảm khi có rung tay, thay đổi lực ép, nhấc ngón tay hoặc tạo nhiễu cơ học tuần hoàn. Giới hạn thứ hai là **chi phí năng lượng của toàn hệ thống**. Nếu chỉ nâng sample rate và chạy pipeline nặng mọi lúc, hệ thống có thể tăng khả năng bám HR, nhưng sẽ đánh đổi trực tiếp thời lượng pin. Giới hạn thứ ba là **độ tin cậy của đầu ra**. Trong bối cảnh cảm biến sinh hiệu, một giá trị HR “đẹp nhưng sai” còn nguy hiểm hơn việc tạm thời không xuất ra giá trị nào.
+Từ góc nhìn triển khai thực tế, khó khăn chính của đề tài không nằm ở việc chỉ chạy được một mô hình TinyML trên ESP32-S3, mà nằm ở việc thiết kế một cơ chế điều phối biết khi nào có thể dùng pipeline nhẹ để tiết kiệm điện, khi nào phải chuyển sang pipeline mạnh hơn để giữ độ tin cậy của đầu ra. Nói cách khác, Phần B không chỉ là phần “thêm AI vào hệ thống”, mà là phần tối ưu hóa quan hệ đánh đổi giữa chất lượng theo dõi và chi phí năng lượng trên phần cứng thật.
 
-Vì vậy, bài toán của Phần B không còn là “dùng AI để chính xác hơn”, mà là thiết kế một cơ chế **adaptive scheduling nhận thức năng lượng**. Hệ thống phải biết khi nào tín hiệu đủ tốt để chỉ dùng DSP nhẹ, khi nào phải chuyển sang chế độ nặng hơn với sample rate cao hơn và TinyML hỗ trợ, và khi nào nên chấp nhận drop window để bảo toàn độ tin cậy của đầu ra.
+Kết quả của Phần A cho thấy một kết luận quan trọng: không tồn tại một cấu hình cảm biến tĩnh tối ưu cho mọi tình huống. Một cấu hình nhẹ có thể đủ tốt khi tay giữ ổn định, nhưng dễ suy giảm khi có thay đổi tiếp xúc hoặc motion artifact. Ngược lại, một cấu hình mạnh và pipeline xử lý nặng hơn có thể cải thiện chất lượng đầu ra, nhưng làm tăng công suất của toàn node cao hơn mức cần thiết nếu duy trì liên tục. Vì vậy, Phần B đặt mục tiêu xây dựng một kiến trúc điều phối thích nghi gồm hai trạng thái vận hành chính:
 
-Kiến trúc cuối cùng của đề tài vì thế được xây theo hai trạng thái:
+- **NORMAL**: ưu tiên tiết kiệm năng lượng, dùng profile cảm biến và pipeline xử lý nhẹ;
+- **HIGH**: ưu tiên độ bền vững của đầu ra, dùng profile mạnh hơn và kích hoạt TinyML hỗ trợ.
 
-- `NORMAL`: đọc ở `50 Hz`, ưu tiên DSP và quality gate bảo thủ.
-- `HIGH`: đọc ở `100 Hz`, trích feature đầy đủ và kích hoạt TinyML để hỗ trợ trong cửa sổ tín hiệu khó.
+Adaptive scheduler là cơ chế quyết định việc chuyển giữa hai trạng thái này.
 
-Điểm quan trọng là Phần B không đi thẳng từ ý tưởng sang kết quả cuối. Toàn bộ quá trình phải đi qua nhiều vòng thử-sai, trong đó mỗi lần thu log và sửa firmware đều thay đổi cách hiểu của tôi về chính hệ thống đang xây.
+[Ghi chú biên tập: Hình B.1 là lưu đồ điều phối hai trạng thái. Nên vẽ lại theo hướng dẫn trong `report_diagram_guides.md`.]
 
----
+## 2. Đặt bài toán và định hướng phương pháp
 
-## 2. Giai đoạn 1: Dựng nền bằng scheduler rule-based
+Ở giai đoạn đầu của đề tài, bài toán được nhìn theo hướng tổng quát là một hệ thống **Energy-Aware Adaptive TinyML Scheduling for Wearable Health Monitoring**. Tuy nhiên, khi đi vào triển khai, mục tiêu cần được thu hẹp và diễn giải lại ở mức phù hợp với prototype đã xây dựng.
 
-### 2.1. Vì sao phải bắt đầu từ luật trước khi dùng AI
+Trong phạm vi của Phần B, bài toán không được đặt theo hướng chẩn đoán y khoa hoàn chỉnh, mà theo hướng đánh giá và điều phối hoạt động của node đeo dựa trên chất lượng tín hiệu PPG và chi phí năng lượng của toàn hệ thống. Cụ thể, hệ thống cần trả lời ba câu hỏi:
 
-Trước khi huấn luyện mô hình, tôi cần một cách quan sát được tín hiệu thật trên phần cứng, hiểu được khi nào cửa sổ tốt, khi nào cửa sổ xấu, và khi nào bộ điều phối nên phản ứng. Vì vậy, bước đầu tiên là xây một scheduler dựa trên luật trong project `ina219_max30102_test.c`.
+1. Trong điều kiện tín hiệu tốt, có thể duy trì một pipeline nhẹ để tiết kiệm điện mà vẫn xuất được HR hợp lý hay không?
+2. Khi tín hiệu trở nên khó hơn hoặc DSP đơn giản không còn đáng tin, có thể kích hoạt một pipeline mạnh hơn để duy trì khả năng xuất HR hay không?
+3. Việc chuyển giữa hai mức xử lý này có tạo ra khác biệt thực sự về công suất tiêu thụ ở mức toàn node hay không?
 
-Ở giai đoạn này, các ngưỡng cơ bản như `SCHED_STD_MIN`, `SCHED_PTP_MIN`, `SCHED_PTP_MAX`, `SCHED_AC_MIN`, `SCHED_AC_HARD`, `SCHED_AC_EASY` được dùng để quyết định:
+Từ ba câu hỏi đó, nghiên cứu được triển khai theo hướng tối ưu đa mục tiêu, trong đó ba tiêu chí quan trọng nhất là:
 
-- cửa sổ có đủ biên độ hay không,
-- tín hiệu có đủ tính chu kỳ hay không,
-- và có nên chuyển trạng thái hay không.
+- giảm công suất trung bình của toàn hệ thống;
+- duy trì khả năng xuất HR trong điều kiện tín hiệu khó;
+- ưu tiên độ tin cậy của đầu ra hơn là tăng coverage một cách hình thức.
 
-Điểm quan trọng về phương pháp là: firmware không được tinh chỉnh “mù” trên board. Toàn bộ log được đẩy ra file CSV, rồi phân tích offline trong `max30102_log_analysis.ipynb`. Quy trình này giúp tôi đồng bộ logic giữa notebook và firmware, thay vì vừa sửa ngưỡng vừa đoán nguyên nhân bằng trực giác.
+Cách đặt bài toán như vậy giúp giữ được tinh thần của báo cáo tiến độ: đề tài vẫn thuộc hướng wearable health monitoring và TinyML trên edge device, nhưng trọng tâm học thuật được đặt đúng vào bài toán điều phối thích nghi theo năng lượng.
 
-### 2.2. Baseline wander và lỗi “inverted logic”
+## 3. Dữ liệu và định hướng mô hình
 
-Phát hiện quan trọng đầu tiên là logic biên độ thô bị đảo nghĩa trong nhiều cửa sổ xấu. Trên lý thuyết, biên độ lớn thường được hiểu là tín hiệu mạnh. Nhưng ở dữ liệu thật, nhiều cửa sổ nhiễu nặng do chuyển động hoặc ấn ngón tay quá mạnh lại có `std` và `ptp` cao hơn cửa sổ tốt. Nếu dùng tín hiệu thô, scheduler sẽ vô tình để nhiều cửa sổ xấu pass quality gate.
+### 3.1. Vai trò của dữ liệu công khai và dữ liệu phần cứng thật
 
-Notebook `max30102_log_analysis.ipynb` chỉ ra rõ điều này trong các cell baseline-wander và so sánh `raw vs detrended`. Kết luận kỹ thuật là: metric chất lượng phải được tính trên tín hiệu đã bỏ nền chậm, chứ không phải trên biên độ thô.
+Tương tự định hướng đã nêu trong báo cáo tiến độ ban đầu, Phần B không xem dữ liệu công khai và dữ liệu phần cứng thật là hai nguồn thay thế nhau, mà là hai nguồn phục vụ hai lớp mục tiêu khác nhau.
 
-Điều đó dẫn đến việc triển khai `scheduler_highpass_ema(...)` trong firmware, với ý tưởng dùng EMA như một bộ bám nền low-pass và lấy phần high-pass bằng `x[i] - lp`. Khi quality metric được tính trên high-pass signal, logic của scheduler mới khớp hơn với bản chất vật lý của tín hiệu PPG.
+Dữ liệu công khai có giá trị chủ yếu ở các khía cạnh sau:
 
-### 2.3. Goldilocks zone thay cho logic “càng to càng tốt”
+- hỗ trợ xây dựng và kiểm tra pipeline tiền xử lý;
+- tạo điều kiện để thử nghiệm nhiều phương án mô hình khác nhau;
+- cho phép đánh giá sai số trong điều kiện tham chiếu rõ ràng hơn so với tín hiệu phần cứng thô.
 
-Sau khi xử lý baseline wander, tôi vẫn thấy một vấn đề: biên độ không thể được đánh giá theo kiểu một chiều. Tín hiệu quá nhỏ thường là tiếp xúc yếu, nhưng tín hiệu quá lớn cũng có thể là hard press hoặc finger tapping. Do đó `SCHED_PTP_MAX` được đưa vào để tạo một vùng chấp nhận kiểu **Goldilocks**:
+Trong khi đó, dữ liệu thu từ prototype phần cứng lại có vai trò khác:
 
-- không quá nhỏ,
-- không quá lớn,
-- đủ để có khả năng là dao động PPG thật.
+- phản ánh ảnh hưởng của lực ép, vị trí tiếp xúc và chuyển động lên tín hiệu PPG;
+- giúp nhận diện các cửa sổ tín hiệu mà DSP đơn giản trở nên kém tin cậy;
+- làm cơ sở để xây dựng quality gate cho scheduler;
+- kiểm tra xem cơ chế điều phối có hoạt động hợp lý trên node thực hay không.
 
-Khi kết hợp `amplitude_ok` với `periodic_ok`, scheduler bắt đầu có khả năng phân biệt tốt hơn giữa:
+Vì vậy, dữ liệu công khai chủ yếu hỗ trợ phần mô hình và quy trình huấn luyện, còn dữ liệu phần cứng thật quyết định tính thực dụng và tính hợp lệ của bộ điều phối trong bối cảnh hệ nhúng.
 
-- cửa sổ tín hiệu tốt,
-- cửa sổ nhiễu biên độ lớn nhưng vô nghĩa sinh lý,
-- và cửa sổ no-contact.
+### 3.2. Hướng mô hình được cân nhắc và lựa chọn cuối cùng
 
-### 2.4. Ý nghĩa của giai đoạn nền tảng
+Trong giai đoạn định hướng ban đầu, hai họ mô hình đã được cân nhắc:
 
-Bước rule-based này có giá trị lớn hơn việc đơn thuần dựng một state machine. Nó giúp tôi thu hẹp đúng phần việc cần giao cho TinyML. Nếu không có bước này, mô hình học máy sẽ phải gánh luôn cả lỗi signal conditioning và quality gate. Sau giai đoạn 1, hệ thống đã có:
+- **MLP dựa trên vector đặc trưng**;
+- **1D CNN dựa trên cửa sổ tín hiệu theo thời gian**.
 
-- pipeline log ổn định,
-- quality metric có ý nghĩa vật lý hơn,
-- state machine ban đầu,
-- và quan trọng nhất là một ngôn ngữ định lượng để mô tả “cửa sổ tốt / xấu”.
+Về mặt lý thuyết, 1D CNN có thể tận dụng trực tiếp hình dạng sóng PPG và tự học các mẫu hình theo thời gian. Tuy nhiên, khi đối chiếu với ràng buộc triển khai thật trên ESP32-S3, hướng này bộc lộ nhiều bất lợi hơn cho giai đoạn đồ án hiện tại: mô hình nặng hơn, khó đồng bộ hoàn toàn giữa pipeline Python và firmware, và khó kiểm soát chi phí bộ nhớ cũng như độ trễ hơn.
 
----
+Sau quá trình thử nghiệm và tinh chỉnh, hệ thống cuối cùng ưu tiên hướng **feature-based MLP**. Quyết định này dựa trên bốn lý do chính:
 
-## 3. Giai đoạn 2: Dataset, feature engineering và tối ưu hóa TinyML
+- mô hình nhỏ hơn và phù hợp hơn với triển khai TinyML trên vi điều khiển;
+- dễ chuẩn hóa đầu vào/đầu ra giữa môi trường huấn luyện và firmware nhúng;
+- thuận lợi hơn cho lượng tử hóa INT8;
+- dễ kiểm soát hơn về chi phí tính toán, bộ nhớ và độ trễ trong thời gian thực.
 
-### 3.1. Vì sao chọn feature-based MLP thay vì raw CNN
+Lựa chọn này phản ánh đúng tinh thần của đề tài: mô hình không được chọn chỉ vì đạt điểm số offline tốt, mà phải phù hợp với hệ nhúng thật và phục vụ được bộ điều phối thích nghi ở cấp hệ thống.
 
-Dataset dùng để huấn luyện là `PPG-DaLiA`, một bộ dữ liệu công khai có PPG và nhịp tim chuẩn từ ECG. Tôi không chọn hướng đưa raw waveform vào CNN vì ba lý do thực dụng:
+## 4. Xây dựng nền tảng điều phối dựa trên luật
 
-- tài nguyên ESP32-S3 hạn chế về RAM và compute;
-- khó đảm bảo pipeline Python và firmware đồng bộ từng bước;
-- khó lượng tử hóa và giải thích hơn trong bối cảnh luận văn.
+### 4.1. Lý do phải bắt đầu từ scheduler dựa trên luật
 
-Thay vào đó, tôi xây một pipeline **feature-based TinyML**. Tín hiệu đầu vào được detrend, band-pass, robust z-score, sau đó trích 16 đặc trưng thời gian và tần số trong `extract_ppg_features(...)` của `ppg_hr_tinyml.cpp`.
+Trước khi tích hợp TinyML, hệ thống được xây dựng trước một scheduler dựa trên luật. Đây không phải là bước phụ, mà là nền tảng cần thiết để hiểu hành vi thực của tín hiệu và của chính prototype.
 
-Các nhóm feature chính gồm:
+Nếu chưa hiểu cửa sổ tín hiệu nào là tốt, cửa sổ nào là xấu, và chưa biết những chỉ số nào có thể tính rẻ trên vi điều khiển để phản ánh chất lượng thực của PPG, thì việc đưa học máy vào quá sớm sẽ chỉ làm tăng độ phức tạp mà không giải quyết được vấn đề gốc.
 
-- biên độ và năng lượng: `std`, `ptp`, `rms`, `abs_mean`, `peak_prom_mean`;
-- cấu trúc thời gian: `n_peaks`, `peak_rate_per_sec`, `slope_abs_mean`;
-- gợi ý từ DSP: `hr_est_mean`, `hr_est_std`, `ac_best`, `ac_best_hr`;
-- miền tần số: `psd_hr_ratio`, `spectral_entropy`, `dom_bpm_hr_band`.
+Scheduler dựa trên luật ở giai đoạn này cho phép:
 
-Đây là thiết kế quan trọng về mặt học thuật: TinyML không thay thế DSP, mà học cách **kết hợp những tín hiệu gợi ý do DSP tạo ra** để suy ra HR trong điều kiện nhiễu.
+- ghi log hệ thống trong nhiều điều kiện đo khác nhau;
+- xây dựng các chỉ số chất lượng rẻ về mặt tính toán;
+- mô phỏng và tinh chỉnh logic chuyển trạng thái bằng dữ liệu thật;
+- xác định rõ vùng nhiệm vụ mà TinyML thực sự cần hỗ trợ.
 
-### 3.2. Từ Random Forest sang MLP
+Nói cách khác, scheduler dựa trên luật đóng vai trò như một lớp nền để hệ thống hiểu tín hiệu, trước khi dùng TinyML để tăng độ bền vững cho các trường hợp khó.
 
-Trong notebook `ppg_dalia.ipynb`, Random Forest và MLP đều được thử làm baseline. `MLP_small` cho kết quả tốt hơn một chút so với `RF`, nhưng điểm quan trọng hơn là MLP phù hợp với triển khai nhúng hơn nhiều. Một mạng fully connected nhỏ có thể xuất sang TFLite Micro, lượng tử hóa INT8 và chạy ổn định trên ESP32-S3, trong khi Random Forest không mang lại lợi thế tương xứng ở lớp triển khai.
+### 4.2. Baseline wander và hiện tượng “inverted logic”
 
-### 3.3. Breakthrough quan trọng nhất: target normalization
+Một phát hiện quan trọng trong giai đoạn này là biên độ lớn ở tín hiệu thô không đồng nghĩa với chất lượng tốt. Trong thực nghiệm, nhiều cửa sổ bị ảnh hưởng bởi chuyển động hoặc lực ép mạnh lại có độ lệch chuẩn và biên độ đỉnh-đỉnh rất lớn, nhưng phần tăng đó chủ yếu đến từ thành phần nền thay đổi chậm chứ không phải từ thành phần nhịp tim hữu ích.
 
-Điểm đột phá không nằm ở việc đổi mô hình, mà ở **chuẩn hóa đầu ra HR** bằng Z-score. Trong notebook, nhãn HR được chuẩn hóa bởi:
+Điều này dẫn tới hiện tượng có thể gọi là **“inverted logic”**: cửa sổ xấu lại dễ vượt quality gate hơn cửa sổ tốt nhưng tiếp xúc nhẹ. Nếu không xử lý, scheduler sẽ dễ hiểu sai tín hiệu và kích hoạt pipeline mạnh vào những lúc không cần thiết.
 
-```python
-hr_mean = float(np.mean(y_train_vec))
-hr_std = float(np.std(y_train_vec) + 1e-6)
-```
-
-sau đó de-normalize lại ở phía firmware bằng:
+Để khắc phục, pipeline được bổ sung bước loại bỏ nền chậm trước khi tính các chỉ số chất lượng. Một dạng cài đặt điển hình của tư tưởng này là bộ lọc high-pass dựa trên EMA:
 
 ```cpp
-*y_bpm = clampf(y_norm * kHrStdBpm + kHrMeanBpm, 40.0f, 180.0f);
+float alpha = dt / (tau_sec + dt);
+lp += alpha * (x[i] - lp);
+y[i] = x[i] - lp;
 ```
 
-với:
+Sau bước này, các chỉ số amplitude và năng lượng phản ánh tốt hơn thành phần dao động hữu ích của PPG, thay vì bị chi phối bởi drift nền.
 
-- `kHrMeanBpm = 89.3519745f`
-- `kHrStdBpm = 22.6059856f`
+### 4.3. Quality gate theo “Goldilocks zone”
 
-Lợi ích của bước này là output của mạng nằm trong không gian dễ lượng tử hóa hơn, nên bản INT8 gần như giữ được chất lượng của bản FP32. Kết quả notebook cho thấy:
+Phân tích tiếp theo cho thấy một cửa sổ tín hiệu tốt không phải là cửa sổ có biên độ càng lớn càng tốt, mà là cửa sổ có biên độ nằm trong một khoảng hợp lý, đồng thời vẫn giữ được tính chu kỳ. Từ đó, quality gate được chuyển từ cách nhìn “vượt ngưỡng là tốt” sang cách nhìn theo **Goldilocks zone**:
 
-- `Keras_MLP MAE = 8.6395`
-- `TFLite_FP32 MAE = 8.6395`
-- `TFLite_INT8 MAE = 8.6512`
+- biên độ không quá nhỏ để tránh trường hợp tín hiệu chìm trong nhiễu;
+- biên độ không quá lớn để tránh trường hợp drift nền hoặc lực ép quá mạnh làm méo tín hiệu;
+- tín hiệu phải có tính chu kỳ nhất định để DSP còn giữ được ý nghĩa.
 
-trong khi model size giảm từ `14.37 KB` xuống `7.79 KB`, đúng mức phù hợp cho triển khai edge.
+Đây là bước chuyển quan trọng từ một scheduler ngưỡng đơn giản sang một bộ đánh giá chất lượng tín hiệu có ý nghĩa vật lý hơn, đồng thời làm nền cho logic kích hoạt TinyML về sau.
 
-### 3.4. Domain shift giữa dữ liệu huấn luyện và phần cứng thật
+## 5. Thiết kế pipeline TinyML cho hệ nhúng
 
-Một quan sát thực nghiệm rất quan trọng là `PPG-DaLiA` thu ở cổ tay, trong khi phần cứng của tôi đo ở đầu ngón tay. Đây là một **domain shift có thật**. PPG ở đầu ngón tay thường có biên độ lớn hơn, nhạy hơn với lực ép, và xuất hiện nhiều periodic artifact kiểu finger tapping hơn.
+### 5.1. Feature engineering và lựa chọn đầu vào
 
-Điều đó giải thích vì sao TinyML không thể được dùng như “hộp đen thay mọi thứ”. Nó phải được đặt trong một khung điều phối có quality gate và state machine đi kèm. Nói cách khác, mô hình chỉ là một phần của lời giải; phần còn lại nằm ở cách hệ thống quyết định khi nào có quyền tin vào mô hình.
+Thay vì đưa trực tiếp tín hiệu thô vào một CNN lớn, hệ thống cuối cùng sử dụng một vector đặc trưng được trích từ cửa sổ PPG. Các nhóm đặc trưng chính gồm:
 
----
+- đặc trưng biên độ và năng lượng;
+- đặc trưng mô tả hình thái theo thời gian;
+- các gợi ý HR lấy từ DSP;
+- đặc trưng miền tần số.
 
-## 4. Giai đoạn 3: Tích hợp dual-core và sửa lỗi hệ thống thời gian thực
+Thiết kế này có hai lợi ích quan trọng. Thứ nhất, nó giữ được tính diễn giải kỹ thuật: khi mô hình hoạt động khác thường, có thể truy ngược về nhóm đặc trưng gây ảnh hưởng. Thứ hai, nó làm cho pipeline Python và pipeline firmware nhúng khớp nhau hơn, giảm rủi ro khi chuyển mô hình từ môi trường huấn luyện sang ESP32-S3.
 
-### 4.1. Bug gốc: inference chặn sensor loop
+### 5.2. Chuẩn hóa đầu ra mục tiêu và lượng tử hóa INT8
 
-Khi đưa mô hình từ notebook lên phần cứng thật, vấn đề lớn nhất không còn là MAE mà là **tính sống còn của pipeline real-time**. Ở phiên bản đầu, việc đọc cảm biến và suy luận TinyML từng nằm trong cùng một luồng. Khi inference kéo dài, MAX30102 không được phục vụ FIFO đúng nhịp, dẫn đến:
-
-- `FIFO overflow`,
-- lỗi đọc pointer,
-- mất đồng bộ I2C,
-- và hiện tượng ngoài đời là sensor/LED “đứng”.
-
-Đây là khoảng cách rất điển hình giữa một mô hình “chạy được” và một hệ thống “vận hành được”.
-
-### 4.2. Kiến trúc dual-core FreeRTOS
-
-Cách sửa đúng không phải là vi chỉnh vài vòng lặp, mà là đổi kiến trúc:
-
-- **Core 0**: đọc sensor, duy trì ring buffer, đọc power monitor;
-- **Core 1**: chạy `inference_task`, đánh giá chất lượng cửa sổ, quyết định state và gọi TinyML khi cần.
-
-Task AI được pin sang Core 1 bằng `xTaskCreatePinnedToCore(...)`, trong khi sensor loop tiếp tục được ưu tiên giữ nhịp ở Core 0. Việc này giải quyết đúng nguyên nhân gốc: đọc sensor không còn bị block bởi suy luận.
-
-### 4.3. Decision freeze, recovery path và smoothing
-
-Sau khi xử lý bug block, firmware còn được bổ sung thêm các cơ chế phòng thủ:
-
-- `decision freeze` để scheduler tạm thời không tự tin quá mức ngay sau khi recover hoặc ngay sau lỗi I2C;
-- `max30102_recover()` để đưa cảm biến về trạng thái sạch khi cần;
-- EMA riêng cho DSP (`kEmaAlpha = 0.35`) và cho AI (`kAiEmaAlpha = 0.15`) để tránh đầu ra HR nhảy gắt.
-
-Cùng với đó, `SCHED_PTP_MAX` được siết lại xuống `35000.0f` ở firmware cuối nhằm chặn tốt hơn periodic motion artifact trên đầu ngón tay. Đây là một ví dụ rõ của việc knowledge từ notebook phải quay ngược trở lại firmware dưới dạng luật bảo thủ hơn.
-
----
-
-## 5. Giai đoạn 4: Chuỗi debug năng lượng V2-V6
-
-Đây là phần thay đổi nhiều nhất so với bản Part B ban đầu. Ban đầu tôi từng cho rằng chỉ cần có adaptive scheduler và TinyML là đủ để chứng minh lợi ích năng lượng. Thực tế không đơn giản như vậy. Cách nối nguồn, cách đọc INA219 và chính cách log power đã ảnh hưởng trực tiếp đến kết luận thực nghiệm.
-
-### 5.1. Từ đo nhánh cảm biến sang đo whole-system power
-
-Ở giai đoạn đầu, INA219 đo nhánh cảm biến. Cách này tốt cho việc hiểu MAX30102, nhưng không thể dùng để trả lời câu hỏi macro-level: `DSP-only`, `AI-assisted`, và `adaptive` khác nhau bao nhiêu khi xét trên **toàn bộ node**.
-
-Vì vậy, wiring cuối cùng được chuyển sang:
-
-`PC USB VBUS -> INA219 shunt -> ESP32 VIN 5V`
-
-sau đó:
-
-- `ESP32 3V3 -> MAX30102`
-- `ESP32 3V3 -> INA219 logic`
-
-Đây là bước thay đổi phương pháp luận lớn nhất của phần đánh giá năng lượng.
-
-### 5.2. V2: khoảng cách power biến mất và adaptive spike bất thường
-
-Ở bộ log `V2`, hai hiện tượng xảy ra cùng lúc:
-
-- `fixed_normal` và `fixed_high` gần như không tách power rõ;
-- `adaptive` có những đoạn power cao kéo dài ngay cả sau khi log đã báo quay về `NORMAL`.
-
-Khi đó còn có một yếu tố phần cứng gây nhiễu: đường cấp nguồn đi qua module `CP2102 USB-to-TTL`, tạo thêm nghi ngờ về sụt áp và parasitic overhead. Kết quả `V2` đủ để kết luận rằng cách đo lúc đó chưa đáng tin, nhưng chưa đủ để chỉ ra nguyên nhân nằm ở firmware hay wiring.
-
-### 5.3. V3: khởi động ở HIGH và phát hiện mẫu `+8.56 s`
-
-Để giảm warm-up artifact, firmware được sửa một dòng:
+Một bước quan trọng trong phần TinyML là chuẩn hóa đầu ra mục tiêu bằng Z-score trước khi huấn luyện. Thay vì học trực tiếp HR theo đơn vị bpm, mô hình học trên phiên bản chuẩn hóa của đầu ra:
 
 ```cpp
-scheduler_state_t initial_state = SCHED_STATE_HIGH;
+y_norm = (y_bpm - hr_mean) / hr_std;
+y_bpm  = y_norm * hr_std + hr_mean;
 ```
 
-Bộ `V3` cho thấy một pattern rất mạnh: sau mỗi lần chuyển vào `NORMAL`, khoảng `8.56 s` sau đó xuất hiện warning đầu tiên và power tăng mạnh. Mốc thời gian này trùng chính xác với lúc **cửa sổ 8 giây đầu tiên đầy**, nghĩa là bất thường không do warning text gây ra, mà do chính khối xử lý cửa sổ bắt đầu chạy.
+Cách làm này giúp quá trình huấn luyện ổn định hơn và làm cho phân bố đầu ra thuận lợi hơn khi chuyển sang lượng tử hóa INT8. Đây là điểm có ý nghĩa thực tế lớn vì đề tài không chỉ cần một mô hình chạy được, mà cần một mô hình đủ nhỏ cho vi điều khiển nhưng vẫn giữ sai số ở mức chấp nhận được.
 
-Phân tích này loại dần các giả thuyết về `UART spam`, `state ping-pong` hay `cache miss` đơn thuần, và đẩy trọng tâm điều tra về path xử lý feature.
+### 5.3. Domain shift giữa dữ liệu huấn luyện và phần cứng thật
 
-### 5.4. Sửa lỗi thứ nhất: tách fast path cho NORMAL
+Một vấn đề cần được nhấn mạnh là dữ liệu huấn luyện và dữ liệu phần cứng thật không hoàn toàn đồng nhất. Dữ liệu công khai thường có điều kiện thu tốt hơn, mức nhiễu có cấu trúc hơn, trong khi tín hiệu từ prototype chịu ảnh hưởng mạnh của lực ép, thay đổi tiếp xúc và motion artifact.
 
-Trong phiên bản trước đó, `NORMAL` vẫn vô tình chạy gần như toàn bộ feature pipeline dành cho TinyML. Điều này làm cho `fixed_normal` tiêu tốn quá gần `fixed_high`, và cũng giải thích tại sao các spike trong `NORMAL` xuất hiện rất đều sau khi cửa sổ đầu tiên đầy.
+Vì vậy, TinyML trong hệ thống cuối cùng không được dùng như một bộ thay thế tuyệt đối cho DSP. Thay vào đó, nó được đặt trong một khung điều phối có quality gate chặt chẽ, nghĩa là chỉ được huy động khi hệ thống đánh giá rằng pipeline nhẹ không còn đủ đáng tin hoặc cần hỗ trợ để duy trì đầu ra.
 
-Tôi đã sửa firmware theo hướng:
+## 6. Kiến trúc thời gian thực trên ESP32-S3
+
+### 6.1. Nút thắt cổ chai của nguyên mẫu ban đầu
+
+Khi chuyển từ phân tích offline sang firmware thời gian thực, hệ thống bộc lộ một nút thắt quan trọng: nếu khối đọc cảm biến và khối xử lý nặng nằm quá gần nhau trong cùng nhịp phục vụ, thời gian đáp ứng của đường thu mẫu bị ảnh hưởng. Khi đó, việc phục vụ cảm biến và việc suy luận/tính đặc trưng có thể tranh chấp tài nguyên, làm cho luồng dữ liệu cảm biến trở nên kém ổn định.
+
+Phát hiện này cho thấy một nguyên tắc rất quan trọng của đề tài: một mô hình hoạt động tốt trong notebook chưa đủ để khẳng định hệ thống sẽ hoạt động tốt trên phần cứng thật. Ở mức node, tổ chức thực thi của firmware có ý nghĩa không kém bản thân mô hình.
+
+### 6.2. Tách nhiệm vụ theo kiến trúc hai lõi
+
+Để khắc phục, hệ thống được tổ chức lại theo hướng khai thác hai lõi của ESP32-S3:
+
+- một lõi ưu tiên đọc cảm biến và duy trì luồng dữ liệu PPG ổn định;
+- lõi còn lại đảm nhiệm các tác vụ nặng hơn như trích chọn đặc trưng và suy luận TinyML.
+
+Song song với thay đổi này, firmware còn được bổ sung:
+
+- cơ chế **decision freeze** sau lỗi hoặc sau khi vừa chuyển trạng thái;
+- cơ chế phục hồi khi truy cập cảm biến gặp sự cố tức thời;
+- làm mượt đầu ra HR để tăng tính ổn định ở lớp ứng dụng.
+
+Những thay đổi này cho thấy phiên bản cuối không chỉ là một pipeline mô hình, mà là một hệ thời gian thực được tổ chức lại để vận hành ổn định trên phần cứng thật.
+
+## 7. Tối ưu hóa năng lượng ở mức kiến trúc
+
+### 7.1. Phát hiện bất thường trong tiêu thụ năng lượng
+
+Trong giai đoạn đầu của Phần B, khi bắt đầu đánh giá năng lượng trên node thật, hệ thống xuất hiện một bất thường quan trọng: ở một số phiên, chế độ **NORMAL** tiêu thụ năng lượng gần với **HIGH**, mặc dù về nguyên tắc NORMAL phải là nhánh nhẹ hơn rõ rệt.
+
+Nếu hiện tượng này không được giải quyết, adaptive scheduling gần như mất ý nghĩa, vì bộ điều phối chỉ thay đổi trạng thái về mặt logic chứ không tạo ra khác biệt thực sự về chi phí vận hành.
+
+### 7.2. Phân tích nguyên nhân gốc
+
+Phân tích sâu hơn cho thấy nguyên nhân chính không nằm ở logic quyết định trạng thái, mà ở kiến trúc thực thi của nhánh NORMAL trong nguyên mẫu ban đầu. Dù được gọi là “nhánh nhẹ”, NORMAL vẫn vô tình đi qua phần đáng kể của pipeline trích chọn đặc trưng vốn chỉ nên phục vụ cho nhánh HIGH.
+
+Khối gây chi phí lớn nhất là phần tính đặc trưng miền tần số theo kiểu DFT trực tiếp. Điều này tạo ra một **compute overhead nền** ngay cả khi hệ thống đang ở trạng thái được kỳ vọng là tiết kiệm điện.
+
+Nói cách khác, NORMAL khi đó đúng về tên gọi nhưng chưa đúng về bản chất kiến trúc.
+
+### 7.3. Tách Fast Path và Slow Path
+
+Để xử lý nguyên nhân gốc, hệ thống được tái cấu trúc thành hai đường xử lý rõ ràng:
+
+- **Fast Path** cho trạng thái NORMAL, chỉ giữ lại các phép tính cần thiết để đánh giá chất lượng tín hiệu và ước lượng HR cơ bản;
+- **Slow Path** cho trạng thái HIGH, kích hoạt đầy đủ trích chọn đặc trưng và mô hình TinyML.
+
+Logic cốt lõi của thay đổi này có thể minh họa ngắn gọn như sau:
 
 ```cpp
-const bool need_full_features = (state_snapshot == SCHED_STATE_HIGH);
-if (!compute_window_metrics(&metrics, need_full_features))
-    continue;
+const bool need_full_features = (state == SCHED_STATE_HIGH);
+if (need_full_features) {
+    extract_ppg_features(...);
+    run_tinyml(...);
+}
 ```
 
-và chỉ cho `HIGH` mới đi vào `extract_ppg_features(...)`. Sau patch này, `NORMAL` giảm chi phí tính toán rõ rệt và spike của `fixed_normal` gần như biến mất.
+Đây là thay đổi kiến trúc quan trọng nhất của phần tối ưu năng lượng, vì từ thời điểm này hai trạng thái bắt đầu khác nhau thật sự ở lượng tính toán được thực thi, thay vì chỉ khác nhau ở tên gọi hoặc ở vài tham số hình thức.
 
-### 5.5. V4-V5: spike còn lại chuyển sang HIGH
+### 7.4. Hiệu chỉnh phương pháp đo công suất
 
-Sau patch trên, hiện tượng bất thường không biến mất hoàn toàn mà **dịch chuyển sang `HIGH`**. Đây là một bước quan trọng về mặt chẩn đoán: patch đầu không vô ích, mà đã giúp cô lập phần còn lại của vấn đề.
+Sau khi tách Fast Path và Slow Path, log công suất vẫn còn xuất hiện một số đỉnh tức thời. Phân tích tiếp cho thấy một phần của hiện tượng này đến từ chính cách lấy mẫu công suất: nếu phép đo bắt đúng thời điểm hệ thống vừa hoàn thành một burst tính toán nặng, giá trị sẽ phản ánh đỉnh tức thời hơn là mức công suất trung bình có ý nghĩa vận hành.
 
-Khi đọc kỹ `compute_window_metrics()`, tôi phát hiện ở `HIGH` vẫn còn một dạng tính toán trùng lặp: vừa chạy một fast path DSP để tính `peak/ac`, vừa gọi `extract_ppg_features()` để làm gần như cùng lượng pre-processing thêm lần nữa. Sau khi bỏ phần tính lặp này, power ở `HIGH` tốt hơn, nhưng chưa hết hoàn toàn.
+Vì vậy, phương pháp đo được hiệu chỉnh theo hướng:
 
-### 5.6. Chẩn đoán cuối cùng ở V5: aliasing của phép đo power
+- đọc telemetry công suất dày hơn theo chu kỳ ngắn;
+- lấy trung bình theo cửa sổ ngắn;
+- ưu tiên so sánh trên giá trị trung bình đại diện cho trạng thái vận hành, thay vì dựa trên từng điểm đỉnh đơn lẻ.
 
-Bộ `V5` là chỗ kết luận bắt đầu rõ ràng. Khi số lượng run đủ nhiều, một sự thật hiện ra:
+Điều chỉnh này là cần thiết về mặt phương pháp luận, vì mục tiêu của đề tài là đánh giá năng lượng vận hành của toàn node, chứ không chỉ mô tả các đỉnh tức thời trong quá trình thực thi.
 
-- có những `HIGH episode` rất giống nhau về `reason=2`, `std_hp`, `ptp_hp`, `ac`, nhưng có episode bị spike mạnh, có episode lại không;
-- `fixed_normal` đôi lúc vẫn xuất hiện một spike lẻ;
-- còn `adaptive` thì tỷ lệ sample `>300 mW` vẫn cao bất thường.
+## 8. Kiến trúc hoàn chỉnh và kết quả macro-level
 
-Điều này khiến tôi đi đến kết luận quan trọng: firmware đúng là có compute burst thật trong `HIGH`, nhưng **cách đọc INA219 gần như tức thời và chu kỳ log 2 giây đang phase-lock vào burst đó**, làm các sample power bị phóng đại thành “plateau spike”.
+Sau quá trình tinh chỉnh, hệ thống cuối cùng đạt được ba đặc tính mong muốn:
 
-Nói cách khác, phần còn lại không còn là bug state machine thuần túy, mà là bug ở **telemetry method**.
+- phép đo năng lượng phản ánh công suất của toàn hệ thống;
+- nhánh **NORMAL** thực sự là nhánh nhẹ;
+- nhánh **HIGH** thực sự là nhánh mạnh có TinyML hỗ trợ.
 
-### 5.7. Sửa lỗi thứ hai: power-window averaging
+![Hình B.2. Biểu đồ công suất theo thời gian của một phiên adaptive điển hình](artifacts/ppg_hr_macro_analysis_v6/adaptive_log_adaptive_4_timeseries_v6.png)
 
-Firmware cuối cùng được sửa theo hướng lấy mẫu INA219 dày hơn và chỉ publish giá trị trung bình theo cửa sổ log:
+Hình B.2 minh họa một phiên adaptive điển hình sau khi kiến trúc đã được tối ưu. Đường công suất thay đổi theo trạng thái vận hành nhưng không còn duy trì các plateau bất thường kéo dài như ở giai đoạn nguyên mẫu ban đầu.
 
-```cpp
-constexpr int64_t kPowerReadPeriodUs = 250LL * 1000LL;
+![Hình B.3. Biểu đồ so sánh công suất trung bình giữa ba chế độ vận hành](artifacts/report_assets/part_b_power_comparison_v6.png)
 
-struct power_window_accumulator_t
-{
-    float bus_sum = 0.0f;
-    float current_sum = 0.0f;
-    float power_sum = 0.0f;
-    int count = 0;
-};
-```
+Hình B.3 cho thấy công suất trung bình của ba chế độ vận hành đã tách biệt rõ ràng ở phiên bản cuối. Đây là điều kiện cần để adaptive scheduling có ý nghĩa ở mức hệ thống.
 
-Sau đó `maybe_sample_power(...)` tích lũy nhiều lần đọc INA219 trong 2 giây, còn `publish_power_average(...)` chỉ ghi ra trung bình trước khi in CSV sparse log. Đây là sửa lỗi đúng bản chất, vì nó biến power telemetry từ một **mẫu tức thời dễ bắt trúng burst** thành một **ước lượng gần hơn với power trung bình của cửa sổ hoạt động**.
+![Hình B.4. Biểu đồ trade-off giữa công suất tiêu thụ và HR coverage](artifacts/report_assets/part_b_tradeoff_v6.png)
 
-### 5.8. V6: xác nhận cuối cùng
+Hình B.4 biểu diễn trực quan quan hệ đánh đổi giữa công suất tiêu thụ và HR coverage. Adaptive scheduling nằm giữa hai baseline và phản ánh đúng vai trò của một cơ chế điều phối cân bằng giữa hiệu năng và năng lượng.
 
-Bộ log `V6` là bộ đầu tiên xác nhận rõ rằng hướng sửa trên là đúng.
+### 8.1. Kết quả chính thức của ba chế độ vận hành
 
-Các kết quả định lượng chính từ notebook [ppg_hr_macro_analysis.ipynb](ppg_hr_macro_analysis.ipynb) là:
+| Chế độ vận hành | Công suất trung bình (mW) | HR coverage (%) |
+|---|---:|---:|
+| Fixed Normal | 261.78 | 46.23 |
+| Adaptive | 273.21 | 65.81 |
+| Fixed High | 286.94 | 89.31 |
 
-- `adaptive`: `273.21 mW`, `65.81%` coverage, `2.03 h`
-- `fixed_high`: `286.94 mW`, `89.31%` coverage, `1.93 h`
-- `fixed_normal`: `261.78 mW`, `46.23%` coverage, `2.12 h`
+Khi phân tích riêng bên trong adaptive scheduler, hệ thống ghi nhận:
 
-Tỷ lệ chiếm trạng thái của adaptive là:
+- **Adaptive state 0**: `263.35 mW`
+- **Adaptive state 1**: `283.11 mW`
 
-- `State 0`: `50.25%`
-- `State 1`: `49.75%`
+Ý nghĩa của kết quả này là rất rõ về mặt kiến trúc. Trạng thái nhẹ của adaptive bám gần baseline **Fixed Normal**, còn trạng thái mạnh bám gần baseline **Fixed High**. Như vậy, bộ điều phối không chỉ thay đổi trạng thái trên logic điều khiển, mà thực sự đưa hệ thống sang hai miền tiêu thụ năng lượng khác nhau.
 
-So với `fixed_high`, adaptive giảm công suất trung bình khoảng `4.79%` và tăng thời lượng tương đương khoảng `5.03%`. Quan trọng hơn, khi nhìn theo state thay vì nhìn theo mode tổng, ta thấy:
+## 9. Chỉ số đánh giá và diễn giải kết quả
 
-- `adaptive/state=0 = 263.35 mW`
-- `fixed_normal = 261.78 mW`
-- `adaptive/state=1 = 283.11 mW`
-- `fixed_high = 286.94 mW`
+### 9.1. Các chỉ số đánh giá chính
 
-Tức là `adaptive` đã bám hai baseline đúng như mong đợi về nghiệp vụ.
+Giống tinh thần của báo cáo tiến độ ban đầu, hệ thống không thể được đánh giá chỉ bằng một chỉ số duy nhất. Ở phiên bản hoàn thiện hơn của Phần B, các trục đánh giá quan trọng nhất là:
 
-Một chỉ báo rất mạnh khác là **adaptive spike rate**. Ở `V5`, tỷ lệ sample `adaptive > 300 mW` còn khoảng `18.1%`. Sang `V6`, con số này giảm xuống còn khoảng `2.9%`. Đồng thời, toàn bộ `V6` không còn:
+- công suất trung bình của từng chế độ vận hành;
+- HR coverage, tức tỷ lệ thời gian hệ thống xuất được một giá trị HR hợp lệ;
+- mức tách biệt giữa các baseline và các trạng thái của adaptive scheduler;
+- độ ổn định vận hành trên phần cứng thật.
 
-- `Recovering MAX30102`
-- `I2C fail`
-- `FIFO overflow`
+Bộ chỉ số này phù hợp với bản chất của đề tài hơn so với cách nhìn chỉ tập trung vào sai số mô hình, vì mục tiêu cuối cùng là tối ưu hóa vận hành của một node wearable chứ không phải chỉ tối ưu hóa một mô hình học máy độc lập.
 
-Điều này xác nhận rằng các anomaly kiểu hệ thống ở các vòng trước không còn chi phối kết quả cuối.
+### 9.2. Diễn giải học thuật của trade-off
 
----
+Coverage của **Adaptive** thấp hơn **Fixed High**, nhưng vẫn cao hơn rõ rệt so với **Fixed Normal**. Khoảng cách này không nên được hiểu là thất bại, mà là hệ quả trực tiếp của hai quyết định thiết kế có chủ đích.
 
-## 6. Kết quả macro-level cuối cùng
+Thứ nhất, hệ thống áp dụng quality gate khá chặt. Khi cửa sổ tín hiệu không đủ đáng tin, hệ thống ưu tiên **không xuất HR** thay vì phát ra một giá trị thiếu căn cứ. Thứ hai, adaptive scheduler phải gánh chi phí chuyển trạng thái và thời gian quá độ mà baseline luôn bật HIGH không có. Vì vậy, việc coverage của Adaptive thấp hơn nhánh mạnh cố định là hợp lý về mặt kiến trúc.
 
-Các figure cuối cùng được xuất trực tiếp từ notebook `V6` và dùng làm bằng chứng trong báo cáo:
+Nói cách khác, hệ thống chấp nhận hy sinh một phần coverage để đổi lấy công suất thấp hơn, miễn là các giá trị HR được giữ lại vẫn có độ tin cậy cao hơn về mặt thực nghiệm.
 
-![Tổng hợp KPI V6](artifacts/ppg_hr_macro_analysis_v6/macro_summary_dashboard_v6.png)
+## 10. Phạm vi hiện tại, rủi ro còn lại và giới hạn của hệ thống
 
-Hình trên cho thấy ba điều:
+Mặc dù hệ thống đã đạt được kết quả rõ ràng hơn so với nguyên mẫu ban đầu, một số giới hạn và rủi ro của đề tài vẫn còn tồn tại.
 
-1. `fixed_normal` là baseline tiết kiệm năng lượng nhất nhưng coverage thấp nhất.
-2. `fixed_high` là baseline coverage tốt nhất nhưng power cao nhất.
-3. `adaptive` nằm giữa hai baseline, đúng bản chất một điểm trade-off thay vì cố thắng tuyệt đối ở một trục duy nhất.
+Thứ nhất, sự khác biệt giữa dữ liệu huấn luyện và dữ liệu phần cứng thật vẫn là một nguồn sai số quan trọng. Tín hiệu PPG thực tế có thể thay đổi mạnh theo lực ép, vị trí tiếp xúc và chuyển động, nên một mô hình hoạt động tốt trong điều kiện dữ liệu chuẩn hóa chưa chắc sẽ giữ nguyên chất lượng khi đưa lên node thật.
 
-Quan sát theo state còn quan trọng hơn khi đánh giá scheduler:
+Thứ hai, tín hiệu PPG ngoài đời thực vẫn chịu ảnh hưởng lớn của motion artifact. Điều này làm cho bài toán không chỉ là “ước lượng HR”, mà còn là “biết khi nào đầu ra HR không còn đáng tin”. Vì vậy, scheduler và quality gate vẫn đóng vai trò thiết yếu, chứ không thể bị thay thế hoàn toàn bởi TinyML.
 
-![So sánh power theo state ở V6](artifacts/ppg_hr_macro_analysis_v6/state_aware_power_comparison_v6.png)
+Thứ ba, nếu scheduler tiếp tục được mở rộng theo hướng quá phức tạp, chi phí triển khai và độ khó bảo vệ thực nghiệm sẽ tăng lên đáng kể. Trong khuôn khổ đồ án tốt nghiệp, một kiến trúc hai trạng thái rõ ràng, có baseline so sánh và có đo năng lượng trên phần cứng thật là phù hợp hơn so với một cơ chế điều phối quá nhiều tầng nhưng khó kiểm chứng.
 
-Đây là bằng chứng rất mạnh cho claim kỹ thuật của đề tài. Nếu `adaptive/state=0` không bám `fixed_normal`, hoặc `adaptive/state=1` không bám `fixed_high`, thì adaptive scheduling chỉ là một label logic chứ chưa thực sự điều phối được chi phí hệ thống. Ở `V6`, điều này đã xảy ra đúng.
+Thứ tư, mọi kết luận về năng lượng vẫn phụ thuộc mạnh vào cách bố trí điểm đo và phương pháp lấy mẫu công suất. Vì vậy, việc duy trì cấu hình đo toàn node và phương pháp lấy trung bình nhất quán là điều bắt buộc để bảo đảm tính so sánh giữa các thực nghiệm.
 
-Về mặt tiến hóa của chính quá trình debug, hình dưới đây quan trọng không kém kết quả cuối:
+## 11. Kết luận
 
-![So sánh V5 và V6](artifacts/ppg_hr_macro_analysis_v6/v5_vs_v6_comparison.png)
+Phần B cho thấy đóng góp chính của đề tài không nằm ở việc chỉ chạy được một mô hình TinyML trên ESP32-S3, mà ở việc xây dựng được một kiến trúc điều phối thích nghi hoàn chỉnh trên phần cứng thật. Hệ thống cuối cùng kết hợp được bốn lớp thành phần:
 
-Hình này cho phép lập luận rằng việc sửa firmware và sửa phương pháp đo năng lượng không chỉ làm đồ thị “đẹp hơn”, mà thực sự làm cho kết quả trở nên **đúng nghiệp vụ hơn**: power gap giữa các baseline hiện ra rõ, còn tỷ lệ spike bất thường giảm mạnh.
+- nền tín hiệu và quality gate từ scheduler dựa trên luật;
+- mô hình TinyML phù hợp với ràng buộc edge deployment;
+- kiến trúc thời gian thực đủ ổn định cho sensing và inference;
+- phương pháp đo năng lượng đủ đúng để đánh giá lợi ích ở cấp hệ thống.
 
-Cuối cùng, một run adaptive đại diện ở `V6` cho thấy state transition và đường power đã hợp lý hơn nhiều so với các vòng debug trước:
+Từ góc nhìn wearable health monitoring, đây là kết quả quan trọng nhất của giai đoạn hiện tại: hệ thống không hoạt động nặng mọi lúc, không hoạt động nhẹ mọi lúc, mà biết khi nào cần trả thêm chi phí tính toán để duy trì độ tin cậy của đầu ra và khi nào nên quay về chế độ tiết kiệm năng lượng.
 
-![Adaptive representative run V6](artifacts/ppg_hr_macro_analysis_v6/adaptive_log_adaptive_4_timeseries_v6.png)
-
-Ở figure này, power thay đổi theo state nhưng không còn xuất hiện các plateau bất thường kéo dài kiểu `V2` hoặc `V5`. Một số điểm power cao ngay sau transition vẫn có thể xuất hiện, nhưng đó là hệ quả tất yếu của averaging window cắt ngang biên state, không còn là dấu hiệu scheduler chạy sai.
-
----
-
-## 7. Diễn giải học thuật của coverage gap
-
-Coverage của `adaptive` ở `V6` là `65.81%`, thấp hơn `fixed_high` (`89.31%`) nhưng cao hơn đáng kể so với `fixed_normal` (`46.23%`). Khoảng cách này không nên được diễn giải là thất bại của adaptive scheduling, mà là kết quả trực tiếp của hai lựa chọn thiết kế có chủ đích.
-
-Thứ nhất, firmware ưu tiên **độ tin cậy của output**. Khi quality gate nghi ngờ cửa sổ không đủ chắc chắn, hệ thống chấp nhận drop thay vì cố ép ra một HR. Trong cảm biến sinh hiệu, đánh đổi này hợp lý hơn việc “có số mọi lúc” nhưng sai.
-
-Thứ hai, adaptive phải gánh **chi phí chuyển trạng thái** mà `fixed_high` không có. Khi đổi giữa `50 Hz` và `100 Hz`, ring buffer, sensor profile và logic quyết định phải đi qua một giai đoạn chuyển tiếp. Điều này tạo ra một vùng mà hệ thống cần bảo thủ hơn, và coverage vì thế không thể bằng một baseline luôn bật `HIGH`.
-
-Do đó, câu trade-off của luận văn ở phiên bản cuối có thể phát biểu như sau:
-
-> Adaptive mode giữ được coverage cao hơn Fixed Normal khoảng 19.6 điểm phần trăm, trong khi vẫn giảm công suất trung bình khoảng 4.8% so với Fixed High ở mức whole-system power.
-
-Trong bối cảnh đề tài này, đó là một kết quả hợp lý và đáng bảo vệ hơn so với việc tối đa hóa coverage bằng mọi giá.
-
----
-
-## 8. Kết luận kỹ thuật của Phần B
-
-Giá trị thực của Phần B không nằm ở việc “gắn một mô hình AI lên ESP32”, mà nằm ở chuỗi tối ưu liên tiếp, trong đó mỗi lần sửa đều được dẫn dắt bởi log thật và phân tích định lượng.
-
-Toàn bộ hành trình có thể tóm gọn theo đúng logic kỹ thuật như sau:
-
-- Rule-based scheduler được xây trước để hiểu tín hiệu thật và hình thành quality gate có ý nghĩa.
-- TinyML được triển khai theo hướng feature-based, đồng bộ chặt giữa Python và C++ để đảm bảo deploy được trên edge.
-- Kiến trúc dual-core được đưa vào khi bug thời gian thực xuất hiện, vì mô hình tốt nhưng sensor loop bị block thì hệ thống vẫn thất bại.
-- Chuỗi log `V2 -> V6` cho thấy đánh giá năng lượng trên embedded system không chỉ là vấn đề firmware, mà còn là vấn đề **đo đúng cái cần đo**.
-- Khi phương pháp đo được sửa đúng và firmware được tối ưu đúng chỗ, `V6` cuối cùng cho kết quả phù hợp cả về kỹ thuật lẫn nghiệp vụ: hai baseline tách rõ, adaptive nằm giữa, không còn lỗi hệ thống, và power-state behavior khớp với ý tưởng scheduler ban đầu.
-
-Đó cũng là lý do tôi xem kết quả `V6` là mốc kết thúc hợp lý của Phần B: hệ thống đã đạt mức ổn định đủ để các con số macro-level có thể được dùng như bằng chứng chính thức trong luận văn.
-
----
-
-## 9. Tài liệu và mã nguồn được dùng làm căn cứ trong phần này
-
-- Firmware rule-based ban đầu: `C:\ml\esp32_projects\ina219_max30102_test\main\ina219_max30102_test.c`
-- Firmware tích hợp cuối: `C:\ml\esp32_projects\ppg_hr_tinyml\main\ppg_hr_tinyml.cpp`
-- Notebook phân tích scheduler: `max30102_log_analysis.ipynb`
-- Notebook huấn luyện TinyML: `ppg_dalia.ipynb`
-- Notebook phân tích macro-level cuối: `ppg_hr_macro_analysis.ipynb`
-- Thư viện phân tích macro-level: `ppg_hr_macro_analysis_lib.py`
-- Artifact V6:
-  - `artifacts/ppg_hr_macro_analysis_v6/macro_summary_dashboard_v6.png`
-  - `artifacts/ppg_hr_macro_analysis_v6/state_aware_power_comparison_v6.png`
-  - `artifacts/ppg_hr_macro_analysis_v6/v5_vs_v6_comparison.png`
-  - `artifacts/ppg_hr_macro_analysis_v6/adaptive_log_adaptive_4_timeseries_v6.png`
+Xét trong ngữ cảnh báo cáo tiến độ đồ án tốt nghiệp, Phần B đồng thời đóng vai trò cầu nối từ phần prototype phần cứng ở Phần A sang phần đánh giá đóng góp của adaptive scheduling ở mức hệ thống. Nó chứng minh rằng bài toán của đề tài không chỉ dừng lại ở “đọc được cảm biến” hay “chạy được TinyML”, mà đã tiến tới mức thiết kế và kiểm chứng một cơ chế điều phối thích nghi có ý nghĩa thực nghiệm trên node thật.

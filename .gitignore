@@ -35,8 +35,9 @@ Thumbs.db
 
 # Dataset and generated artifacts in this workspace
 data/
-artifacts/
 max30102/*.txt
+artifacts/
+*.joblib
 
 log/
 docs/

@@ -1,304 +1,167 @@
-﻿# BÁO CÁO XÂY DỰNG HỆ THỐNG PROTOTYPE
-ESP32-S3 + MAX30102 + INA219
+# PHẦN A: XÂY DỰNG VÀ KIỂM CHỨNG NGUYÊN MẪU PHẦN CỨNG
 
-## 1. Mục tiêu
+## 1. Giới thiệu
 
-Phần A có mục tiêu xây dựng và kiểm chứng một prototype phần cứng đủ tin cậy để làm nền cho giai đoạn tối ưu năng lượng và tích hợp TinyML ở Phần B. Trọng tâm của giai đoạn này không phải là tối ưu mô hình, mà là trả lời bốn câu hỏi cơ bản:
+Sau giai đoạn tìm hiểu đề tài, nghiên cứu xác định rằng phần nguyên mẫu phần cứng không chỉ có nhiệm vụ “đọc được cảm biến”, mà phải tạo ra một nền thực nghiệm đủ tin cậy để đánh giá bài toán điều phối thích nghi theo năng lượng ở giai đoạn sau. Vì vậy, Phần A tập trung vào ba mục tiêu chính: xây dựng hệ phần cứng có thể thu tín hiệu PPG ổn định, tích hợp kênh đo công suất, và tổ chức logging đủ nhất quán để phục vụ phân tích offline.
 
-- ESP32-S3 có thể điều khiển ổn định bus I2C và đọc đồng thời hai ngoại vi hay không.
-- MAX30102 có tạo ra được tín hiệu PPG đủ rõ để suy ra nhịp tim cơ bản trong điều kiện nghỉ hay không.
-- INA219 có đo được telemetry năng lượng đủ ổn định để so sánh các cấu hình vận hành hay không.
-- Toàn bộ pipeline phần cứng, firmware và logging có đủ trưởng thành để làm nền cho adaptive scheduling ở giai đoạn tiếp theo hay không.
+Điểm cốt lõi của giai đoạn này là tạo ra một hệ thống có thể quan sát đồng thời hai đại lượng vốn thường bị tách rời trong các bài toán thử nghiệm nhỏ: chất lượng tín hiệu sinh lý và chi phí năng lượng. Điều đó giúp phần đánh giá ở Phần B không bị rơi vào tình trạng mô hình tốt nhưng không biết hệ thống thực sự tiêu thụ bao nhiêu điện, hoặc đo được công suất nhưng không gắn được với trạng thái thực của tín hiệu.
 
-Vì vậy, Part A đóng vai trò như một báo cáo xác nhận nền tảng: xác nhận phần cứng hoạt động, xác nhận dữ liệu đo được có ý nghĩa, và xác nhận cách ghép hệ thống cho phép quan sát đồng thời cả tín hiệu sinh lý lẫn năng lượng tiêu thụ.
+## 2. Phân tích vai trò của các thành phần trong đề tài
 
----
+### 2.1. Thành phần Energy-Aware
 
-## 2. Phần cứng sử dụng
+Trong đề tài này, “energy-aware” không nên được hiểu đơn giản là giảm tần suất hoạt động càng nhiều càng tốt. Nghiên cứu xem đây là một bài toán đánh đổi giữa mức tiêu thụ năng lượng và khả năng duy trì giám sát sức khỏe ở mức chấp nhận được. Muốn đạt được điều đó, hệ thống phải đo được năng lượng của từng chế độ vận hành và phải phân biệt được khi nào nên dùng pipeline nhẹ, khi nào phải dùng pipeline mạnh.
 
-### 2.1. ESP32-S3
+Ngay từ Part A, điều này đã dẫn tới yêu cầu tích hợp một kênh đo công suất trực tiếp trên phần cứng, thay vì chỉ ước lượng chi phí từ thông số kỹ thuật của linh kiện.
 
-Bộ xử lý trung tâm là ESP32-S3 N16R8, được lập trình bằng ESP-IDF. Trong prototype này, ESP32-S3 đảm nhiệm các vai trò sau:
+### 2.2. Thành phần Wearable Health Monitoring
 
-- khởi tạo và làm `I2C master` cho toàn hệ thống;
-- cấu hình, đọc dữ liệu và reset ngoại vi khi cần;
-- xử lý tín hiệu mức cơ bản để quan sát dạng sóng và ước lượng BPM ban đầu;
-- ghi log telemetry qua UART để phục vụ phân tích offline bằng Python/Jupyter;
-- làm nền tảng phần cứng cho scheduler và TinyML ở Phần B.
+Thiết bị được định hướng cho ngữ cảnh wearable health monitoring, nên các ràng buộc không chỉ là đọc được tín hiệu mà còn bao gồm:
 
-Điểm quan trọng là ESP32-S3 không chỉ là vi điều khiển đọc cảm biến, mà còn là nơi hội tụ của cả ba lớp chức năng: điều khiển thiết bị, xử lý tín hiệu và về sau là suy luận học máy. Do đó, mọi đánh giá năng lượng nghiêm túc ở các giai đoạn sau đều phải tính chi phí của chính ESP32-S3, chứ không thể chỉ nhìn riêng cảm biến quang.
+- nguồn năng lượng hạn chế;
+- môi trường đo có nhiễu do chuyển động;
+- tiếp xúc cảm biến không luôn ổn định;
+- yêu cầu theo dõi kéo dài và gần liên tục.
 
-### 2.2. Cảm biến MAX30102
+Những ràng buộc này làm cho việc xây dựng nguyên mẫu phần cứng trở thành một bước có ý nghĩa học thuật rõ ràng. Nó buộc nghiên cứu phải chuyển từ cách tiếp cận “đo được trong điều kiện lý tưởng” sang “đo được trên một hệ có thể phát triển thành kiến trúc điều phối thích nghi”.
 
-MAX30102 là cảm biến PPG tích hợp LED đỏ, LED hồng ngoại, photodiode và khối front-end quang học. Thiết bị giao tiếp qua I2C và cho phép cấu hình được:
+## 3. Các thành phần phần cứng
 
-- `sample rate`;
-- `pulse width`;
-- `sample averaging`;
-- dòng LED cho từng kênh quang.
+### 3.1. Cảm biến MAX30102
 
-Dữ liệu đầu ra của MAX30102 là chuỗi mẫu số theo thời gian trên hai kênh `RED` và `IR`. Đây chưa phải nhịp tim hay SpO2, mà chỉ là tín hiệu quang phản xạ cần được xử lý tiếp. Chính điều này làm cho MAX30102 phù hợp với mục tiêu của đề tài: nó vừa cho phép kiểm chứng tín hiệu PPG thật, vừa buộc hệ thống phải tự giải quyết bài toán xử lý tín hiệu và điều phối tài nguyên.
+MAX30102 là cảm biến quang dùng để thu tín hiệu quang thể tích đồ (PPG). Cảm biến tích hợp LED đỏ, LED hồng ngoại, photodiode và khối xử lý quang học mức thấp, đồng thời hỗ trợ giao tiếp I2C với vi điều khiển. Tín hiệu đầu ra của MAX30102 không phải là nhịp tim trực tiếp, mà là chuỗi mẫu quang theo thời gian cần được xử lý tiếp để suy ra BPM hoặc các đặc trưng liên quan.
 
-### 2.3. Cảm biến INA219
+Điểm quan trọng của MAX30102 trong đề tài này là khả năng cấu hình được nhiều tham số vận hành như:
 
-INA219 là mạch đo điện áp, dòng điện và công suất qua I2C. Module sử dụng điện trở shunt trên board để đo sụt áp nhỏ và từ đó suy ra dòng tải. Trong prototype này, INA219 được dùng để ghi lại ba đại lượng:
+- tốc độ lấy mẫu;
+- độ rộng xung;
+- số lần lấy trung bình;
+- dòng kích LED.
 
-- `bus voltage`;
-- `current`;
-- `power`.
+Các tham số này tác động trực tiếp đến cả chất lượng tín hiệu lẫn mức tiêu thụ điện, do đó có vai trò rất quan trọng đối với tư tưởng điều phối thích nghi ở Phần B.
 
-Sự hiện diện của INA219 là yếu tố biến prototype từ một mạch “đọc được PPG” thành một hệ có thể nghiên cứu bài toán năng lượng. Không có telemetry năng lượng, các phát biểu về tiết kiệm pin ở Phần B sẽ chỉ dừng ở mức giả định.
+### 3.2. Cảm biến INA219
 
-### 2.4. Kiến trúc hệ thống tổng thể
+INA219 là mạch đo điện áp, dòng điện và công suất qua giao tiếp I2C. Vai trò của INA219 trong nghiên cứu không chỉ là một thiết bị phụ trợ, mà là thành phần cho phép định lượng bài toán tiết kiệm năng lượng một cách thực nghiệm. Nếu không có INA219, mọi kết luận về việc adaptive scheduling giúp tiết kiệm điện sẽ chỉ dừng ở mức giả định.
 
-Sơ đồ khối của hệ thống cần được hiểu theo hai lớp song song: lớp truyền thông điều khiển và lớp đường cấp nguồn dùng để đo năng lượng.
+Một điểm đáng chú ý được rút ra ngay từ giai đoạn Part A là vị trí đặt INA219 trên đường nguồn quyết định trực tiếp ý nghĩa của kết quả đo. Đo trên nhánh cảm biến và đo trên toàn hệ thống là hai phép đo khác nhau về bản chất, phục vụ hai câu hỏi nghiên cứu khác nhau.
 
-Ở lớp điều khiển, `ESP32-S3` là nút trung tâm, đóng vai trò `I2C master` cho hai slave:
+### 3.3. ESP32-S3
 
-- `MAX30102` tại địa chỉ `0x57`;
-- `INA219` tại địa chỉ `0x40`.
+ESP32-S3 là phần tử xử lý trung tâm của hệ thống. Trong nguyên mẫu phần cứng, vi điều khiển này đảm nhiệm:
 
-ESP32-S3 gửi lệnh cấu hình, đọc dữ liệu mẫu từ MAX30102, đọc các thanh ghi điện áp-dòng-công suất từ INA219, sau đó ghi toàn bộ telemetry ra UART để phân tích offline. Trong block diagram mới của hệ thống, phần chữ `Scheduler, TinyML` nằm ngay trong khối ESP32-S3 là hợp lý, vì về bản chất mọi quyết định thích nghi ở Phần B đều được thực thi trên vi điều khiển này chứ không nằm ở cảm biến.
+- khởi tạo và điều khiển bus I2C;
+- cấu hình MAX30102 và đọc dữ liệu `RED/IR`;
+- đọc telemetry năng lượng từ INA219;
+- ghi log ra UART;
+- làm nền tảng triển khai DSP, scheduler và TinyML ở các giai đoạn sau.
 
-Ở lớp cấp nguồn, prototype đã trải qua hai cấu hình đo khác nhau.
+Việc lựa chọn ESP32-S3 có ý nghĩa quan trọng vì đây là môi trường triển khai thực của toàn bộ bài toán. Các quyết định về cảm biến, dữ liệu và mô hình đều phải phù hợp với giới hạn tài nguyên và hành vi thời gian thực của vi điều khiển này.
 
-#### Bước 1: Đo nhánh cảm biến
+## 4. Kiến trúc hệ thống và hai cấu hình đo năng lượng
 
-Ở giai đoạn khảo sát phần cứng ban đầu, INA219 được đặt trên nhánh cấp nguồn của riêng MAX30102. Cấu hình này hữu ích khi cần trả lời các câu hỏi rất cụ thể về cảm biến, ví dụ:
+Về mặt khối chức năng, hệ thống gồm một nút xử lý trung tâm ESP32-S3, một cảm biến PPG MAX30102 và một mạch đo năng lượng INA219. ESP32-S3 đóng vai trò `I2C master`, còn MAX30102 và INA219 là các thiết bị `I2C slave`. Dữ liệu được thu nhận và ghi log đồng bộ để có thể phân tích ngoài tuyến.
 
-- tăng `LED current` làm biên độ tín hiệu thay đổi thế nào;
-- thay đổi `sample rate` làm riêng MAX30102 tiêu thụ thêm bao nhiêu;
-- `averaging = 1` và `averaging = 4` khác nhau ra sao về chi phí năng lượng của chính cảm biến.
+[Ghi chú biên tập: Tái sử dụng sơ đồ khối tổng thể đã có trong PDF báo cáo tiến độ cũ cho Hình A.1. Nếu cần vẽ lại, xem hướng dẫn tại `report_diagram_guides.md`.]
 
-Đây là phép đo đúng cho mục tiêu “hiểu MAX30102”, nhưng chưa đủ để kết luận ở mức hệ thống.
+### 4.1. Cấu hình đo nhánh cảm biến
 
-#### Bước 2: Đo công suất toàn hệ thống
+Ở giai đoạn khảo sát đặc tính phần cứng, INA219 được đặt trên nhánh cấp nguồn của riêng MAX30102. Cách đo này hữu ích khi cần trả lời các câu hỏi dạng:
 
-Khi bài toán chuyển sang adaptive scheduling, mục tiêu không còn là đo riêng cảm biến mà là đo chi phí thật của toàn node. Cấu hình cuối cùng vì vậy được chuyển sang:
+- tăng dòng LED làm riêng cảm biến tiêu thụ thêm bao nhiêu;
+- thay đổi tốc độ lấy mẫu ảnh hưởng thế nào tới năng lượng của cảm biến;
+- chế độ lấy trung bình làm thay đổi quan hệ giữa chất lượng tín hiệu và công suất ra sao.
 
-`USB VBUS 5V từ PC -> INA219 VIN+ -> shunt nội bộ INA219 -> INA219 VIN- -> ESP32 VIN 5V`
+Đây là phép đo phù hợp cho giai đoạn “hiểu cảm biến”.
 
-Sau đó:
+### 4.2. Cấu hình đo công suất toàn hệ thống
 
-- rail `3V3` của ESP32 cấp lại cho `MAX30102`;
-- rail `3V3` của ESP32 cấp cho logic của `INA219`;
-- toàn bộ hệ thống dùng chung mass.
+Khi nghiên cứu chuyển sang mục tiêu đánh giá adaptive scheduling, phép đo trên nhánh cảm biến không còn đủ. Lý do là phần chênh lệch năng lượng quan trọng lúc này không chỉ đến từ MAX30102, mà còn đến từ:
 
-Kiến trúc này có ý nghĩa phương pháp luận rất lớn: mọi dòng tiêu thụ của node, bao gồm vi điều khiển, xử lý DSP, TinyML, UART logging và cảm biến, đều đi qua shunt của INA219. Vì vậy, các kết quả macro-level về power ở Phần B là `whole-system power`, không phải `sensor-only power`.
+- xử lý DSP trên ESP32-S3;
+- trích chọn đặc trưng;
+- suy luận TinyML;
+- logging và điều phối trạng thái.
 
----
+Vì vậy, hệ thống được chuyển sang cấu hình đo công suất toàn hệ thống, trong đó đường nguồn của toàn node đi qua shunt của INA219 trước khi cấp vào vi điều khiển. Đây là cơ sở phương pháp luận để các kết quả macro-level ở Phần B phản ánh đúng chi phí vận hành của toàn bộ node, thay vì chỉ phản ánh một thành phần riêng lẻ.
 
-## 3. Môi trường firmware và các project thử nghiệm
+[Ghi chú biên tập: Hình A.3 nên dùng sơ đồ hai cấu hình đo năng lượng đặt cạnh nhau. Có thể vẽ lại nhanh theo ASCII và hướng dẫn trong `report_diagram_guides.md`.]
 
-### 3.1. Project đọc MAX30102
+## 5. Quy trình tích hợp và kiểm chứng các mô-đun
 
-Bước đầu tiên của quá trình phát triển là xác nhận ESP32-S3 có thể giao tiếp ổn định với MAX30102, đọc được dữ liệu `RED/IR` liên tục và ghi log ra UART. Ở bước này, mục tiêu chưa phải là tối ưu năng lượng hay xây scheduler, mà là xác nhận tín hiệu thô tồn tại và có biến thiên phù hợp với nhịp mạch khi đặt ngón tay đúng cách.
+### 5.1. Kiểm chứng giao tiếp I2C
 
-### 3.2. Project đọc INA219
+Bước đầu tiên của quá trình tích hợp là xác nhận từng ngoại vi hoạt động ổn định trên bus I2C. Nghiên cứu kiểm tra khả năng nhận diện thiết bị, ghi-đọc thanh ghi cấu hình và đọc dữ liệu lặp lại trong thời gian đủ dài. Việc kiểm chứng này có ý nghĩa nền tảng, vì nếu lớp giao tiếp phần cứng không ổn định thì các đánh giá tín hiệu và năng lượng đều không đáng tin cậy.
 
-Song song với MAX30102, một firmware thử nghiệm riêng cho INA219 được dùng để kiểm chứng ba việc:
+### 5.2. Thu nhận tín hiệu PPG
 
-- giao tiếp I2C với địa chỉ cấu hình đúng;
-- đọc được `bus voltage`, `shunt voltage`, `current`, `power`;
-- hiểu được độ ổn định và độ nhạy của phép đo trong điều kiện cấp nguồn thực tế.
+Sau khi giao tiếp ổn định, hệ thống được dùng để thu dữ liệu quang theo thời gian thực. Nghiên cứu quan sát đồng thời hai kênh `RED` và `IR`, từ đó nhận thấy thành phần nền lớn và thành phần dao động nhỏ mang thông tin nhịp tim. Trong điều kiện tiếp xúc tốt, tín hiệu tạo ra dạng sóng có chu kỳ hợp lý và đủ rõ để suy ra nhịp tim cơ bản.
 
-Điều này quan trọng vì sai số hay dao động trong phép đo điện năng có thể dẫn đến kết luận sai ở các giai đoạn tối ưu sau.
+![Hình A.2. Dạng sóng PPG điển hình trong điều kiện đặt tay ổn định](artifacts/report_assets/part_a_ppg_waveform_stable.png)
 
-### 3.3. `ina219_max30102_test`
+Hình A.2 được trích trực tiếp từ log ổn định của MAX30102, thể hiện rõ thành phần dao động tuần hoàn của kênh quang. Đây là bằng chứng thực nghiệm cho thấy nguyên mẫu phần cứng đã đủ tốt để xây dựng một baseline DSP ở điều kiện nghỉ.
 
-Project `ina219_max30102_test` là cột mốc kết nối Part A với Part B. Đây không chỉ là project ghép hai cảm biến vào cùng một firmware, mà còn là nền tảng cho toàn bộ workflow nghiên cứu về sau.
+### 5.3. Ghi telemetry năng lượng đồng bộ với tín hiệu
 
-Vai trò của project này gồm:
+Một điểm mạnh của nguyên mẫu là dữ liệu tín hiệu và dữ liệu năng lượng không được thu tách rời, mà được ghi trên cùng một trục thời gian. Cách tổ chức này giúp phân tích offline có thể đối chiếu trực tiếp giữa chất lượng tín hiệu và mức tiêu thụ điện trong từng cấu hình vận hành. Đây chính là cầu nối giữa Part A và bài toán điều phối thích nghi ở Part B.
 
-- ghép MAX30102 và INA219 vào cùng một hệ thống trên ESP32-S3;
-- thu đồng thời dữ liệu quang và telemetry năng lượng;
-- chuẩn hóa định dạng log CSV để đưa vào notebook phân tích;
-- tạo ra dữ liệu thực nghiệm cho việc xây quality gate và scheduler rule-based;
-- về sau là cầu nối giữa thực nghiệm phần cứng và adaptive TinyML scheduling.
+## 6. Khảo sát tín hiệu PPG và các tham số cấu hình cảm biến
 
-Điểm quan trọng là project này đã hỗ trợ cả hai kiểu đo năng lượng đã nêu ở phần kiến trúc: ban đầu đo nhánh cảm biến, sau đó chuyển sang đo công suất toàn hệ thống để phục vụ macro evaluation.
+### 6.1. Ảnh hưởng của sample rate, LED current, averaging và pulse width
 
----
-
-## 4. Khảo sát tín hiệu PPG từ MAX30102
-
-### 4.1. Đọc dữ liệu `RED/IR`
-
-Sau khi giao tiếp I2C ổn định, firmware ghi lại hai kênh `RED` và `IR` theo thời gian. Quan sát trực tiếp trên log cho thấy khi đặt ngón tay đúng cách, cả hai kênh đều có thành phần DC lớn và dao động AC nhỏ chồng lên trên. Thành phần AC này chính là phần chứa thông tin nhịp mạch.
-
-Thực nghiệm cũng cho thấy tín hiệu phụ thuộc mạnh vào điều kiện tiếp xúc:
-
-- đặt tay ổn định cho dạng sóng đều hơn;
-- lực ép quá nhẹ làm biên độ nhỏ, dễ nhiễu;
-- lực ép quá mạnh làm tín hiệu méo và dễ bão hòa cục bộ;
-- rung tay hoặc gõ tay tạo nhiễu cơ học mạnh, xuất hiện baseline wander và đỉnh giả.
-
-Những quan sát này là dữ kiện đầu tiên dẫn đến quyết định sau này phải có scheduler thích nghi thay vì dùng một pipeline cố định cho mọi tình huống.
-
-### 4.2. Ảnh hưởng của cấu hình cảm biến
-
-Part A tập trung khảo sát bốn nhóm tham số chính của MAX30102:
+Thực nghiệm cho thấy bốn nhóm tham số cấu hình chính của MAX30102 ảnh hưởng đồng thời tới cả tín hiệu PPG và chi phí năng lượng:
 
 - `sample rate`;
-- `pulse width`;
+- `LED current`;
 - `sample averaging`;
-- `LED current`.
+- `pulse width`.
 
-Mục tiêu không phải là tìm một bộ tham số “đẹp nhất” theo trực giác, mà là hiểu trade-off giữa chất lượng tín hiệu và chi phí năng lượng.
+Nghiên cứu rút ra rằng các tham số này không nên được xem như những nút chỉnh độc lập chỉ để làm “đẹp” tín hiệu. Mỗi thay đổi đều kéo theo một đánh đổi giữa độ rõ của dạng sóng, độ nhạy với chuyển động, lượng dữ liệu phải xử lý và mức công suất tiêu thụ.
 
-Kết quả thực nghiệm cho thấy:
+### 6.2. Ước lượng BPM cơ bản
 
-- tăng `sample rate` giúp bám động học tốt hơn nhưng làm tăng dữ liệu phải xử lý và thường kéo theo tăng tiêu thụ;
-- tăng `LED current` có thể cải thiện biên độ tín hiệu khi tiếp xúc yếu, nhưng nếu quá cao lại dễ đẩy hệ vào vùng bão hòa hoặc lãng phí năng lượng;
-- `averaging` cao làm tín hiệu mượt hơn nhưng đồng thời làm thay đổi tốc độ hiệu dụng và đặc tính phản ứng của dữ liệu;
-- `pulse width` tác động tới năng lượng mỗi xung và độ phân giải ADC, nên phải chọn cân bằng với mục tiêu đo.
+Từ tín hiệu PPG thô, hệ thống xây dựng một pipeline DSP cơ bản để:
 
-Bài học rút ra là không tồn tại một cấu hình cố định duy nhất tối ưu cho mọi trạng thái tiếp xúc. Đây là nền tảng trực tiếp của ý tưởng `NORMAL profile` và `HIGH profile` ở Part B.
-
-### 4.3. Ước lượng BPM cơ bản
-
-Từ tín hiệu PPG thô, firmware và notebook thực hiện một pipeline đơn giản gồm:
-
-- bỏ thành phần nền hoặc xu thế chậm;
-- làm nổi thành phần dao động chứa nhịp tim;
-- dò đỉnh hoặc dùng tương quan để suy ra chu kỳ tim;
+- loại bỏ xu thế nền chậm;
+- làm nổi phần dao động mang thông tin nhịp tim;
+- dò đỉnh hoặc dùng tương quan để suy ra chu kỳ;
 - đổi chu kỳ thành BPM.
 
-Trong điều kiện nghỉ và tiếp xúc ổn định, cách làm này cho ra BPM hợp lý. Ý nghĩa của kết quả này rất quan trọng: nó chứng minh rằng phần cứng và cảm biến đủ tốt để cung cấp một baseline DSP thực thụ, không phải chỉ cho ra “sóng đẹp” nhưng vô dụng.
+Trong điều kiện nghỉ, pipeline này cho kết quả hợp lý. Điều đó xác nhận rằng nguyên mẫu phần cứng không chỉ tạo ra dữ liệu thô, mà đã đủ để xây dựng một baseline xử lý nhịp tim có giá trị thực nghiệm.
 
-### 4.4. Giới hạn của phương pháp BPM cơ bản
+### 6.3. Giới hạn của BPM cơ bản
 
-Tuy nhiên, Part A cũng cho thấy rõ giới hạn của pipeline này. Peak detection và autocorrelation hoạt động tốt khi điều kiện đo thuận lợi, nhưng suy giảm nhanh khi xuất hiện:
+Tuy nhiên, nghiên cứu cũng ghi nhận rõ rằng BPM cơ bản suy giảm nhanh khi điều kiện đo trở nên khó hơn, chẳng hạn khi:
 
-- chuyển động ngón tay;
 - thay đổi lực ép;
-- nhấc tay hoặc chạm không đủ chặt;
-- dao động cơ học tuần hoàn gây đỉnh giả.
+- tiếp xúc lỏng;
+- rung tay;
+- xuất hiện dao động cơ học tuần hoàn.
 
-Điểm này cần được nhấn mạnh để nối sang Part B: BPM cơ bản của Part A là một baseline hữu ích, nhưng chưa phải lời giải đủ mạnh cho một wearable hoạt động trong điều kiện thật.
+Điểm này có vai trò như một kết luận chuyển tiếp: nguyên mẫu phần cứng đã đủ để chứng minh khả năng đo, nhưng chưa đủ để giải quyết bài toán wearable trong điều kiện thực. Chính giới hạn này là động lực trực tiếp của adaptive scheduling và TinyML ở Phần B.
 
----
-
-## 5. Đo năng lượng với INA219
-
-### 5.1. Mục tiêu của phép đo năng lượng
-
-Phép đo năng lượng trong Part A có hai vai trò khác nhau theo từng giai đoạn phát triển:
-
-- ở giai đoạn đầu, nó giúp hiểu đặc tính tiêu thụ của riêng MAX30102 dưới các cấu hình khác nhau;
-- ở giai đoạn sau, nó trở thành công cụ để đánh giá chi phí thật của toàn hệ thống khi có DSP, TinyML và adaptive scheduling.
-
-Việc phân biệt hai mục tiêu này là cần thiết. Nếu chỉ đo nhánh cảm biến, có thể trả lời câu hỏi “MAX30102 tiêu thụ bao nhiêu”, nhưng không thể trả lời câu hỏi quan trọng hơn của đề tài là “toàn bộ node đeo tiêu thụ bao nhiêu khi đổi chiến lược xử lý”.
-
-### 5.2. Telemetry và logging
-
-Firmware tích hợp ghi lại đồng thời:
-
-- timestamp;
-- trạng thái hoặc profile vận hành;
-- các tín hiệu `RED/IR`;
-- `bus voltage`, `current`, `power` từ INA219.
-
-Thiết kế log đồng bộ này là quyết định kỹ thuật quan trọng. Nhờ nó, notebook không chỉ nhìn thấy năng lượng hay tín hiệu một cách riêng rẽ, mà có thể so sánh trực tiếp: tại thời điểm tín hiệu xấu đi thì power thay đổi thế nào, khi đổi profile thì power có tăng tương ứng hay không, và liệu các lần chuyển trạng thái có gây chi phí phụ không.
-
-### 5.3. Vì sao phải chuyển sang whole-system power
-
-Kết quả debug qua các vòng log sau này xác nhận rằng chuyển từ đo nhánh cảm biến sang đo `whole-system power` là bắt buộc. Các chênh lệch giữa `DSP-only`, `AI-assisted`, và `adaptive` chủ yếu nằm ở phần chi phí của chính ESP32-S3, không chỉ ở LED hay ADC của MAX30102.
-
-Nói cách khác, nếu vẫn giữ cách đo cũ thì kết luận năng lượng sẽ bị thiên lệch. Part A vì vậy không chỉ xây phần cứng, mà còn xây đúng cách đo cho câu hỏi nghiên cứu của Part B.
-
----
-
-## 6. Tích hợp toàn hệ thống
-
-### 6.1. Ghép bus I2C dùng chung
-
-ESP32-S3 giao tiếp với cả MAX30102 và INA219 trên cùng một bus I2C. Điều này giúp kiến trúc gọn, đúng với bối cảnh embedded thực tế, nhưng đồng thời buộc firmware phải quản lý truy cập thiết bị cẩn thận. Khi hệ thống còn đơn giản ở Part A, việc này chủ yếu là kiểm tra đúng địa chỉ và thứ tự cấu hình. Sang Part B, đây chính là nền để tách sensor task và AI task mà không làm hỏng truy cập ngoại vi.
-
-### 6.2. Hai cấu hình nối ghép đã sử dụng
-
-Trong suốt quá trình làm đề tài, hai cấu hình wiring sau đều có giá trị, nhưng phục vụ hai mục tiêu khác nhau.
-
-#### Cách 1: Đo nhánh cảm biến MAX30102
-
-INA219 được đặt trên đường cấp nguồn của MAX30102. Cách làm này phù hợp cho việc khảo sát cảm biến ở mức vi mô, ví dụ khi thay đổi `LED current` hoặc `sample rate` và muốn biết riêng cảm biến tăng thêm bao nhiêu điện.
-
-#### Cách 2: Đo công suất toàn hệ thống
-
-Sau khi chuyển sang đánh giá adaptive scheduling, wiring được đổi sang cấu hình cuối cùng:
-
-`PC USB 5V -> INA219 -> ESP32 VIN 5V`
-
-với:
-
-- `ESP32 3V3 -> MAX30102`;
-- `ESP32 3V3 -> INA219 logic`;
-- toàn hệ thống dùng chung `GND`.
-
-Đây là cấu hình đúng với câu hỏi nghiên cứu cuối cùng và là cấu hình được dùng cho các log macro-level đã chốt ở V6. Cách nối này cũng khớp với block diagram mới: INA219 vừa là một `I2C slave`, vừa là phần tử nằm trên đường năng lượng đang được giám sát.
-
-### 6.3. Ý nghĩa phương pháp luận
-
-Việc thay đổi cách nối ghép không phải là một chi tiết phụ của phần cứng, mà là một bước hiệu chỉnh phương pháp. Nó cho thấy cùng một bộ phần cứng có thể cho ra kết luận rất khác nếu đo sai đại lượng cần đo. Part A vì vậy đóng góp không chỉ ở mức “lắp mạch chạy được”, mà còn ở mức xây đúng nền đo lường cho giai đoạn đánh giá thuật toán sau này.
-
----
-
-## 7. Kết quả đạt được và bài học thiết kế
+## 7. Kết quả chính của Phần A và bài học thiết kế
 
 ### 7.1. Kết quả đạt được
 
-Đến cuối Part A, prototype đã đạt được các kết quả cốt lõi sau:
+Đến cuối Part A, hệ nguyên mẫu đã đạt được các kết quả quan trọng sau:
 
-- ESP32-S3 giao tiếp ổn định với MAX30102 và INA219 qua I2C;
-- log được đồng thời tín hiệu quang và telemetry năng lượng;
-- quan sát được tín hiệu PPG thật và suy ra BPM cơ bản trong điều kiện nghỉ;
-- xác nhận được rằng cấu hình cảm biến ảnh hưởng đồng thời tới chất lượng tín hiệu và chi phí năng lượng;
-- xây được một firmware tích hợp đủ tốt để làm nền cho notebook phân tích và các bước tối ưu tiếp theo.
+- ESP32-S3 giao tiếp ổn định với MAX30102 và INA219;
+- hệ thống thu được tín hiệu PPG có ý nghĩa;
+- BPM cơ bản có thể được suy ra trong điều kiện tiếp xúc thuận lợi;
+- telemetry năng lượng được ghi đồng bộ với tín hiệu;
+- phương pháp đo năng lượng đã tiến hóa từ cảm biến riêng lẻ sang toàn node.
 
-### 7.2. Bài học thiết kế rút ra từ thực nghiệm tín hiệu và công suất
+### 7.2. Bài học thiết kế
 
-Từ toàn bộ thí nghiệm Part A, có bốn bài học quan trọng.
+Từ các thực nghiệm phần cứng, nghiên cứu rút ra bốn bài học lớn.
 
-Thứ nhất, MAX30102 rất nhạy với điều kiện tiếp xúc. Tín hiệu thay đổi mạnh theo lực ép, vị trí đặt tay và chuyển động cơ học, nên mọi kết luận dựa trên một điều kiện đặt tay đơn lẻ đều dễ bị thiên lệch.
+Thứ nhất, tín hiệu PPG rất nhạy với điều kiện tiếp xúc, do đó mọi đánh giá trên thiết bị đeo đều phải tính đến yếu tố nhiễu cơ học. Thứ hai, các tham số cấu hình của cảm biến tạo ra đánh đổi trực tiếp giữa chất lượng tín hiệu và năng lượng, nên không tồn tại một cấu hình tĩnh tối ưu cho mọi điều kiện. Thứ ba, phương pháp đo năng lượng phải được thiết kế cùng với câu hỏi nghiên cứu; đo sai vị trí sẽ dẫn tới kết luận sai. Thứ tư, phần cứng nguyên mẫu chỉ là điều kiện cần; để giải quyết bài toán cuối cùng cần có thêm một cơ chế chọn chiến lược xử lý theo trạng thái thực của tín hiệu.
 
-Thứ hai, các tham số như `sample rate`, `averaging`, `pulse width` và `LED current` ảnh hưởng đồng thời tới cả chất lượng tín hiệu lẫn năng lượng. Không có một cấu hình cố định vừa tối ưu cho mọi điều kiện đo vừa tối ưu cho pin.
+## 8. Hạn chế của Phần A và động cơ chuyển sang Phần B
 
-Thứ ba, cách đo năng lượng phải tiến hóa cùng câu hỏi nghiên cứu. Đo nhánh cảm biến là đúng cho giai đoạn hiểu MAX30102, nhưng không đủ cho giai đoạn đánh giá scheduler và TinyML. Việc chuyển sang đo `whole-system power` là bắt buộc nếu muốn kết luận đúng ở mức hệ thống.
+Mặc dù Part A đã xác lập được nền phần cứng và hệ đo, giai đoạn này vẫn còn ba giới hạn lớn.
 
-Thứ tư, Part A đã xác nhận phần cứng sẵn sàng, nhưng cũng cho thấy rõ những gì phần cứng thuần chưa giải quyết được: motion artifact, chất lượng tín hiệu thay đổi mạnh theo bối cảnh, và chi phí năng lượng không thể tối ưu bằng một cấu hình tĩnh.
+Trước hết, pipeline BPM cơ bản chưa đủ bền vững trước chuyển động và biến thiên tiếp xúc. Tiếp theo, cấu hình cảm biến tĩnh không thể đồng thời tối ưu cả chất lượng tín hiệu lẫn năng lượng cho mọi tình huống. Cuối cùng, việc đã đo được công suất toàn hệ thống mới chỉ tạo ra điều kiện đánh giá, chứ chưa tạo ra cơ chế thực sự để giảm công suất đó.
 
----
-
-## 8. Vai trò của Part A đối với phần đánh giá năng lượng sau này
-
-Các kết quả macro-level cuối cùng ở notebook `ppg_hr_macro_analysis.ipynb` và các artifact `V6` không xuất hiện từ đầu. Chúng dựa trực tiếp trên ba nền tảng được xây ở Part A:
-
-- nền tảng phần cứng đủ ổn định để chạy lâu và ghi log nhiều phiên;
-- nền tảng telemetry đủ đồng bộ để đối chiếu tín hiệu với năng lượng;
-- nền tảng wiring đủ đúng để đo chi phí thật của toàn bộ node.
-
-Nói cách khác, Part B chỉ có thể bảo vệ được các con số năng lượng cuối cùng vì Part A đã làm xong phần việc khó hơn tưởng tượng: chuẩn hóa hệ đo và chuẩn hóa cách quan sát hệ thống.
-
----
-
-## 9. Hạn chế của Part A và động cơ chuyển sang Part B
-
-Mặc dù prototype ở Part A đã chứng minh được khả năng đọc tín hiệu PPG, ước lượng BPM cơ bản và ghi lại telemetry năng lượng, vẫn còn ba hạn chế lớn cần giải quyết ở giai đoạn tiếp theo.
-
-### 9.1. Hạn chế về độ bền vững của thuật toán
-
-Pipeline BPM hiện tại chủ yếu dựa trên peak detection và xử lý tín hiệu đơn giản. Cách làm này phù hợp để kiểm chứng cảm biến, nhưng chưa đủ mạnh khi người dùng thay đổi lực ép, rung tay hoặc tạo motion artifact tuần hoàn.
-
-### 9.2. Hạn chế của cấu hình tĩnh
-
-Kết quả Part A cho thấy không có một cấu hình MAX30102 cố định nào vừa tiết kiệm năng lượng vừa luôn cho tín hiệu tốt trong mọi điều kiện. Điều này dẫn trực tiếp tới ý tưởng phải có nhiều profile vận hành và một bộ điều phối quyết định khi nào dùng profile nào.
-
-### 9.3. Động cơ trực tiếp sang Part B
-
-Từ các kết quả ở Part A, bài toán ở giai đoạn tiếp theo không còn là “đọc được tín hiệu”, mà là:
-
-- khi nào tín hiệu đủ tốt để chỉ dùng DSP nhẹ;
-- khi nào cần nâng profile cảm biến và dùng pipeline mạnh hơn;
-- làm sao để việc chuyển đổi đó thực sự tạo ra lợi ích năng lượng ở mức toàn hệ thống.
-
-Đó chính là lý do Part B tập trung vào adaptive scheduling, TinyML và đánh giá `whole-system power` bằng các bộ log V2-V6. Nếu diễn đạt ngắn gọn, Part A tạo ra nền phần cứng và nền đo lường; Part B khai thác hai nền đó để tối ưu hệ thống ở mức vận hành thật.
+Do đó, Part B kế thừa trực tiếp nền tảng của Part A và giải quyết phần còn thiếu: xây dựng adaptive scheduler, tích hợp TinyML và đánh giá xem việc chuyển đổi giữa các profile vận hành có thực sự đem lại lợi ích năng lượng ở cấp hệ thống hay không.
