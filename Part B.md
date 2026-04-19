@@ -1,4 +1,4 @@
-﻿# PHẦN B. TỐI ƯU HÓA NĂNG LƯỢNG VÀ TÍCH HỢP TINYML CHO BỘ ĐIỀU PHỐI THÍCH NGHI
+# PHẦN B. TỐI ƯU HÓA NĂNG LƯỢNG VÀ TÍCH HỢP TINYML CHO BỘ ĐIỀU PHỐI THÍCH NGHI
 
 ## 1. Giới thiệu
 
@@ -205,37 +205,125 @@ if (need_full_features) {
 
 ### 7.4. Hiệu chỉnh phương pháp đo công suất
 
-Sau khi tách Fast Path và Slow Path, log công suất vẫn còn xuất hiện một số đỉnh tức thời. Phân tích tiếp cho thấy một phần của hiện tượng này đến từ chính cách lấy mẫu công suất: nếu phép đo bắt đúng thời điểm hệ thống vừa hoàn thành một burst tính toán nặng, giá trị sẽ phản ánh đỉnh tức thời hơn là mức công suất trung bình có ý nghĩa vận hành.
+Sau khi tách Fast Path và Slow Path, việc chỉ nhìn vào log công suất averaged ở cùng một MCU không còn đủ để trả lời câu hỏi quan trọng nhất của đề tài: chi phí năng lượng thực sự nằm ở đâu trong một cửa sổ xử lý `HIGH`? Nếu chỉ đo công suất tổng quát theo thời gian, ta biết hệ thống đã tách được `NORMAL` và `HIGH`, nhưng vẫn chưa biết bao nhiêu năng lượng thuộc về **DSP/feature extraction**, bao nhiêu thuộc về **TinyML Invoke**, và phần “đuôi công suất” sau burst kéo dài đến đâu.
 
-Vì vậy, phương pháp đo được hiệu chỉnh theo hướng:
+Vì vậy, ở vòng đánh giá cuối, hệ thống được mở rộng thành một kiến trúc **dual-MCU DAQ**:
 
-- đọc telemetry công suất dày hơn theo chu kỳ ngắn;
-- lấy trung bình theo cửa sổ ngắn;
-- ưu tiên so sánh trên giá trị trung bình đại diện cho trạng thái vận hành, thay vì dựa trên từng điểm đỉnh đơn lẻ.
+- **Target ESP32-S3** chạy scheduler và xuất hai tín hiệu đồng bộ phần cứng:
+  - `PROFILING_FEATURE_GPIO`: lên mức cao trong lúc chạy `extract_ppg_features(...)`;
+  - `PROFILING_INVOKE_GPIO`: lên mức cao trong lúc gọi `g_interpreter->Invoke()`.
+- **DAQ ESP32 + INA219** đo `bus_v`, `current_ma`, `power_mw` đồng thời lấy mẫu hai chân sync và ghi ra `daq.csv`.
+- `target.csv` giữ toàn bộ log UART nội bộ của ESP32-S3, bao gồm thời gian `TinyML Invoke time: ... us` cho từng lần suy luận.
 
-Điều chỉnh này là cần thiết về mặt phương pháp luận, vì mục tiêu của đề tài là đánh giá năng lượng vận hành của toàn node, chứ không chỉ mô tả các đỉnh tức thời trong quá trình thực thi.
+Kiến trúc này tạo ra hai lớp dữ liệu đồng bộ theo sự kiện:
 
-## 8. Kiến trúc hoàn chỉnh và kết quả macro-level
+- `target.csv` cho biết **cửa sổ nào thực sự gọi TinyML** và `Invoke()` kéo dài bao nhiêu micro-giây;
+- `daq.csv` cho biết **dạng công suất tức thời** của burst tính toán và cho phép tích phân năng lượng.
 
-Sau quá trình tinh chỉnh, hệ thống cuối cùng đạt được ba đặc tính mong muốn:
+Một điểm quan trọng được rút ra từ dữ liệu thật là tốc độ lấy mẫu hữu hiệu của DAQ không đạt `500 us/sample` như cấu hình mục tiêu ban đầu. Khi đo trực tiếp từ chênh lệch `timestamp_us` trong log V7, chu kỳ lấy mẫu trung vị chỉ còn khoảng **`3298-3299 us/sample`**. Điều này không làm mất giá trị của hệ đo, nhưng nó thay đổi cách diễn giải:
 
-- phép đo năng lượng phản ánh công suất của toàn hệ thống;
-- nhánh **NORMAL** thực sự là nhánh nhẹ;
-- nhánh **HIGH** thực sự là nhánh mạnh có TinyML hỗ trợ.
+- DAQ vẫn đủ tốt để bắt được **burst feature extraction** kéo dài nhiều mili-giây;
+- DAQ **không đủ nhanh** để luôn bắt được xung `Invoke()` chỉ dài vài trăm micro-giây;
+- vì vậy, `infer_pin_state` không thể là nguồn duy nhất để ước lượng năng lượng AI.
 
-![Hình B.2. Biểu đồ công suất theo thời gian của một phiên adaptive điển hình](artifacts/ppg_hr_macro_analysis_v6/adaptive_log_adaptive_4_timeseries_v6.png)
+Để giải quyết, cặp `target.csv` và `daq.csv` được ghép theo **thứ tự burst** thay vì cố ép hai file về cùng mốc thời gian tuyệt đối. Trong log thực nghiệm, khi gộp các cụm hoạt động ở DAQ mà cách nhau không quá một mẫu trống, số burst thu được khớp hoàn toàn với số cửa sổ `HIGH` trong `target.csv`. Từ đó, mỗi cửa sổ `HIGH` được gắn với đúng một burst công suất.
 
-Hình B.2 minh họa một phiên adaptive điển hình sau khi kiến trúc đã được tối ưu. Đường công suất thay đổi theo trạng thái vận hành nhưng không còn duy trì các plateau bất thường kéo dài như ở giai đoạn nguyên mẫu ban đầu.
+Năng lượng của từng burst được tính theo dạng tích phân rời rạc có xét **power tail**:
 
-![Hình B.3. Biểu đồ so sánh công suất trung bình giữa ba chế độ vận hành](artifacts/report_assets/part_b_power_comparison_v6.png)
+```text
+E_total = Σ max(P_i - P_baseline, 0) · Δt_i
+```
 
-Hình B.3 cho thấy công suất trung bình của ba chế độ vận hành đã tách biệt rõ ràng ở phiên bản cuối. Đây là điều kiện cần để adaptive scheduling có ý nghĩa ở mức hệ thống.
+trong đó:
 
-![Hình B.4. Biểu đồ trade-off giữa công suất tiêu thụ và HR coverage](artifacts/report_assets/part_b_tradeoff_v6.png)
+- `P_baseline` là median công suất của một cửa sổ yên tĩnh ngay trước burst;
+- `Δt_i` lấy trực tiếp từ `timestamp_us` của DAQ;
+- miền tích phân không dừng ở lúc chân sync xuống thấp, mà kéo dài cho đến khi công suất trở lại vùng baseline.
 
-Hình B.4 biểu diễn trực quan quan hệ đánh đổi giữa công suất tiêu thụ và HR coverage. Adaptive scheduling nằm giữa hai baseline và phản ánh đúng vai trò của một cơ chế điều phối cân bằng giữa hiệu năng và năng lượng.
+Đối với TinyML, vì `Invoke()` quá ngắn so với nhịp lấy mẫu DAQ, năng lượng AI được ước lượng theo:
 
-### 8.1. Kết quả chính thức của ba chế độ vận hành
+```text
+E_AI ≈ P_peak_active · t_invoke
+```
+
+trong đó `P_peak_active` là đỉnh công suất dư `max(P - P_baseline)` của burst tương ứng, còn `t_invoke` lấy trực tiếp từ log `TinyML Invoke time` của ESP32-S3. Phần còn lại của burst được quy về DSP/feature extraction:
+
+```text
+E_DSP = E_total - E_AI
+```
+
+Phương pháp này cho phép trả lời đúng câu hỏi mà lớp macro-level chưa thể trả lời: **năng lượng thực sự được tiêu tốn chủ yếu ở đâu trong pipeline chậm**.
+
+## 8. Đánh giá vi mô bằng kiến trúc dual-MCU hardware sync
+
+Sau khi hoàn thiện refactor Fast Path/Slow Path và thay DFT ngây thơ bằng pipeline tối ưu hơn, hệ thống được đo lại bằng bộ log **V7**. Kết quả vi mô cho thấy ba điểm rất rõ:
+
+- `NORMAL` không tạo burst `feature/infer` nữa, nghĩa là nhánh nhẹ đã thực sự tách khỏi Slow Path;
+- thời gian `Invoke()` của MLP INT8 chỉ ở mức vài trăm micro-giây;
+- chi phí năng lượng chủ đạo của cửa sổ `HIGH` vẫn nằm ở DSP và phần đuôi công suất sau burst.
+
+![Hình B.2. Burst công suất điển hình với hai chân sync phần cứng](artifacts/ppg_hr_micro_analysis_v7/representative_burst_v7.png)
+
+Hình B.2 cho thấy một burst điển hình trong chế độ `fixed_high`. Dải công suất tăng mạnh khi `feature_pin_state` lên cao, sau đó còn duy trì một **power tail** rõ rệt ngay cả khi hai chân sync đã về mức thấp. Với burst đại diện này, tổng năng lượng tích phân đạt khoảng `1484.39 µJ`, trong khi phần TinyML chỉ được ước lượng khoảng `31.42 µJ`, tương đương xấp xỉ `2.12%`.
+
+![Hình B.3. Giới hạn phân giải thời gian của DAQ so với Invoke thực tế](artifacts/ppg_hr_micro_analysis_v7/micro_timing_resolution_v7.png)
+
+Hình B.3 giải thích vì sao `infer_pin_state` không thể được dùng đơn độc để đo AI. Trong log V7:
+
+- chu kỳ lấy mẫu DAQ trung vị khoảng `3298-3299 µs`;
+- thời gian `Invoke()` trung bình chỉ khoảng `373.94-380.46 µs`;
+- tỷ lệ burst mà DAQ bắt được `infer_pin_state=1` chỉ đạt `45.71%` ở `fixed_high` và `73.68%` ở `adaptive`.
+
+Nói cách khác, ngay cả khi xung `Invoke()` có được phát ra đúng, DAQ vẫn có thể bỏ lỡ nó đơn giản vì xung này ngắn hơn nhiều so với bước lấy mẫu. Việc kết hợp `invoke_time_us` từ `target.csv` với biên độ công suất dư của burst vì vậy là bắt buộc về mặt phương pháp.
+
+![Hình B.4. So sánh baseline power, total burst energy và tách DSP/AI](artifacts/ppg_hr_micro_analysis_v7/micro_energy_dashboard_v7.png)
+
+Hình B.4 tổng hợp kết quả vi mô của các burst `HIGH` trong V7. Bảng dưới đây trình bày các chỉ số quan trọng nhất:
+
+| Chỉ số vi mô của Slow Path | Adaptive (`state=1`) | Fixed High |
+|---|---:|---:|
+| Baseline yên tĩnh (mW) | 253.00 | 254.00 |
+| Chu kỳ lấy mẫu DAQ trung vị (µs) | 3299.00 | 3298.00 |
+| Thời gian `Invoke()` trung bình (µs) | 380.46 | 373.94 |
+| Độ rộng xung feature quan sát được (µs) | 7200.21 | 6961.80 |
+| Thời gian tích phân toàn burst (µs) | 28994.95 | 25609.89 |
+| Thời gian power tail trung bình (µs) | 18583.05 | 16574.89 |
+| Total active energy mỗi burst (µJ) | 1460.10 | 1393.12 |
+| DSP energy ước lượng mỗi burst (µJ) | 1426.75 | 1359.03 |
+| TinyML energy ước lượng mỗi burst (µJ) | 33.35 | 34.08 |
+| Tỷ trọng AI theo năng lượng tích lũy (%) | 2.28 | 2.45 |
+
+Từ bảng này có thể rút ra ba kết luận định lượng rất mạnh.
+
+Thứ nhất, **MLP INT8 thực sự rất nhẹ**. Ở cả `adaptive/state=1` lẫn `fixed_high`, mỗi lần `Invoke()` chỉ tiêu tốn khoảng `33-34 µJ`, tức nhỏ hơn rất nhiều so với năng lượng toàn burst khoảng `1.39-1.46 mJ`. Tỷ trọng AI tính theo năng lượng tích lũy chỉ khoảng **`2.28%` ở adaptive** và **`2.45%` ở fixed_high**.
+
+Thứ hai, **bottleneck năng lượng thực sự nằm ở DSP/feature extraction**, không nằm ở mô hình. Chỉ riêng phần DSP đã tiêu tốn khoảng `1.36-1.43 mJ` cho mỗi burst, lớn hơn phần AI hơn một bậc độ lớn. Điều này xác nhận bằng dữ liệu thật rằng thiết kế TinyML của đề tài không hề là phần “nặng” của hệ thống; trái lại, mô hình đang ở mức rất hiệu quả về năng lượng.
+
+Thứ ba, **power tail là thành phần không thể bỏ qua**. Nếu chỉ tích phân trong lúc chân sync ở mức cao, kết quả sẽ đánh giá thiếu đáng kể năng lượng của burst. Trong V7, thời gian tail trung bình còn dài hơn bản thân độ rộng xung feature quan sát được. Vì vậy, việc tích phân đến khi công suất thực sự trở về baseline là điều kiện bắt buộc để phép đo có ý nghĩa vật lý.
+
+Một phát hiện bổ sung cũng rất quan trọng là refactor DSP đã thực sự loại bỏ nút thắt cũ. Ở giai đoạn trước tối ưu, feature extraction từng có lúc kéo dài hàng trăm mili-giây. Trong log V7 sau tối ưu, độ rộng xung feature quan sát được chỉ còn khoảng **`6.96-7.20 ms`**, còn toàn burst kể cả tail vào khoảng **`25.61-28.99 ms`**. Điều này cho thấy hướng tối ưu bằng Fast Path/Slow Path và FFT đã giải quyết đúng nguyên nhân gốc.
+
+![Hình B.5. Phân bố năng lượng burst giữa hai chế độ Slow Path](artifacts/ppg_hr_micro_analysis_v7/burst_energy_distribution_v7.png)
+
+Hình B.5 cho thấy phân bố năng lượng burst của `adaptive/state=1` và `fixed_high` khá gần nhau. Điều này cũng phù hợp về mặt hệ thống: khi adaptive đã quyết định chuyển sang `HIGH`, nó thực thi gần như cùng một Slow Path với baseline `fixed_high`; khác biệt năng lượng còn lại chủ yếu đến từ độ khó của từng cửa sổ tín hiệu cụ thể chứ không đến từ bản thân MLP.
+
+## 9. Kết quả macro-level và diễn giải trade-off ở cấp hệ thống
+
+Kết quả vi mô ở trên trả lời câu hỏi “burst `HIGH` tốn năng lượng ở đâu”. Tuy nhiên, mục tiêu cuối cùng của đề tài vẫn là đánh giá **lợi ích hệ thống** của adaptive scheduling khi chạy liên tục trên node thật. Ở lớp này, chỉ số quan trọng vẫn là công suất trung bình, coverage và mức tách biệt giữa các trạng thái vận hành.
+
+![Hình B.6. Biểu đồ công suất theo thời gian của một phiên adaptive điển hình](artifacts/ppg_hr_macro_analysis_v6/adaptive_log_adaptive_4_timeseries_v6.png)
+
+Hình B.6 minh họa một phiên adaptive điển hình sau khi kiến trúc đã được tối ưu. Đường công suất thay đổi theo trạng thái vận hành nhưng không còn duy trì các plateau bất thường kéo dài như ở giai đoạn nguyên mẫu ban đầu.
+
+![Hình B.7. Biểu đồ so sánh công suất trung bình giữa ba chế độ vận hành](artifacts/report_assets/part_b_power_comparison_v6.png)
+
+Hình B.7 cho thấy công suất trung bình của ba chế độ vận hành đã tách biệt rõ ràng ở phiên bản cuối. Đây là điều kiện cần để adaptive scheduling có ý nghĩa ở mức hệ thống.
+
+![Hình B.8. Biểu đồ trade-off giữa công suất tiêu thụ và HR coverage](artifacts/report_assets/part_b_tradeoff_v6.png)
+
+Hình B.8 biểu diễn trực quan quan hệ đánh đổi giữa công suất tiêu thụ và HR coverage. Adaptive scheduling nằm giữa hai baseline và phản ánh đúng vai trò của một cơ chế điều phối cân bằng giữa hiệu năng và năng lượng.
+
+### 9.1. Kết quả chính thức của ba chế độ vận hành
 
 | Chế độ vận hành | Công suất trung bình (mW) | HR coverage (%) |
 |---|---:|---:|
@@ -250,26 +338,13 @@ Khi phân tích riêng bên trong adaptive scheduler, hệ thống ghi nhận:
 
 Ý nghĩa của kết quả này là rất rõ về mặt kiến trúc. Trạng thái nhẹ của adaptive bám gần baseline **Fixed Normal**, còn trạng thái mạnh bám gần baseline **Fixed High**. Như vậy, bộ điều phối không chỉ thay đổi trạng thái trên logic điều khiển, mà thực sự đưa hệ thống sang hai miền tiêu thụ năng lượng khác nhau.
 
-## 9. Chỉ số đánh giá và diễn giải kết quả
-
-### 9.1. Các chỉ số đánh giá chính
-
-Giống tinh thần của báo cáo tiến độ ban đầu, hệ thống không thể được đánh giá chỉ bằng một chỉ số duy nhất. Ở phiên bản hoàn thiện hơn của Phần B, các trục đánh giá quan trọng nhất là:
-
-- công suất trung bình của từng chế độ vận hành;
-- HR coverage, tức tỷ lệ thời gian hệ thống xuất được một giá trị HR hợp lệ;
-- mức tách biệt giữa các baseline và các trạng thái của adaptive scheduler;
-- độ ổn định vận hành trên phần cứng thật.
-
-Bộ chỉ số này phù hợp với bản chất của đề tài hơn so với cách nhìn chỉ tập trung vào sai số mô hình, vì mục tiêu cuối cùng là tối ưu hóa vận hành của một node wearable chứ không phải chỉ tối ưu hóa một mô hình học máy độc lập.
-
 ### 9.2. Diễn giải học thuật của trade-off
 
 Coverage của **Adaptive** thấp hơn **Fixed High**, nhưng vẫn cao hơn rõ rệt so với **Fixed Normal**. Khoảng cách này không nên được hiểu là thất bại, mà là hệ quả trực tiếp của hai quyết định thiết kế có chủ đích.
 
 Thứ nhất, hệ thống áp dụng quality gate khá chặt. Khi cửa sổ tín hiệu không đủ đáng tin, hệ thống ưu tiên **không xuất HR** thay vì phát ra một giá trị thiếu căn cứ. Thứ hai, adaptive scheduler phải gánh chi phí chuyển trạng thái và thời gian quá độ mà baseline luôn bật HIGH không có. Vì vậy, việc coverage của Adaptive thấp hơn nhánh mạnh cố định là hợp lý về mặt kiến trúc.
 
-Nói cách khác, hệ thống chấp nhận hy sinh một phần coverage để đổi lấy công suất thấp hơn, miễn là các giá trị HR được giữ lại vẫn có độ tin cậy cao hơn về mặt thực nghiệm.
+Điểm mới quan trọng sau phân tích V7 là ta có thể diễn giải trade-off này sâu hơn: khi adaptive buộc phải vào `HIGH`, chi phí thêm mà hệ thống trả ra không đến từ bản thân MLP, mà chủ yếu đến từ khối DSP và phần tail của burst công suất. Như vậy, adaptive scheduling vẫn giữ đúng tinh thần “AI-aware nhưng energy-first”: TinyML được dùng như một lớp hỗ trợ cực nhẹ, còn phần chi phí thật sự cần quản trị nằm ở việc quyết định **khi nào Slow Path đáng để kích hoạt**.
 
 ## 10. Phạm vi hiện tại, rủi ro còn lại và giới hạn của hệ thống
 
@@ -281,7 +356,7 @@ Thứ hai, tín hiệu PPG ngoài đời thực vẫn chịu ảnh hưởng lớ
 
 Thứ ba, nếu scheduler tiếp tục được mở rộng theo hướng quá phức tạp, chi phí triển khai và độ khó bảo vệ thực nghiệm sẽ tăng lên đáng kể. Trong khuôn khổ đồ án tốt nghiệp, một kiến trúc hai trạng thái rõ ràng, có baseline so sánh và có đo năng lượng trên phần cứng thật là phù hợp hơn so với một cơ chế điều phối quá nhiều tầng nhưng khó kiểm chứng.
 
-Thứ tư, mọi kết luận về năng lượng vẫn phụ thuộc mạnh vào cách bố trí điểm đo và phương pháp lấy mẫu công suất. Vì vậy, việc duy trì cấu hình đo toàn node và phương pháp lấy trung bình nhất quán là điều bắt buộc để bảo đảm tính so sánh giữa các thực nghiệm.
+Thứ tư, dù kiến trúc dual-MCU DAQ đã cải thiện mạnh khả năng micro-profiling, hệ đo hiện tại vẫn còn giới hạn phân giải thời gian. Dữ liệu V7 cho thấy DAQ chỉ đạt khoảng `3.3 ms/sample`, trong khi `Invoke()` chỉ kéo dài khoảng `0.37-0.38 ms`. Vì vậy, năng lượng AI trong báo cáo này vẫn là **ước lượng có kiểm soát** dựa trên `invoke_time_us` của target kết hợp với đỉnh công suất dư của burst, chứ chưa phải phép đo trực tiếp ở mức vi mô hoàn toàn tách biệt. Tuy nhiên, ngay cả với cách ước lượng bảo thủ này, phần AI vẫn chỉ chiếm khoảng `2.3-2.4%`, nên kết luận về tính nhẹ của TinyML vẫn rất vững.
 
 ## 11. Kết luận
 
@@ -290,8 +365,10 @@ Phần B cho thấy đóng góp chính của đề tài không nằm ở việc 
 - nền tín hiệu và quality gate từ scheduler dựa trên luật;
 - mô hình TinyML phù hợp với ràng buộc edge deployment;
 - kiến trúc thời gian thực đủ ổn định cho sensing và inference;
-- phương pháp đo năng lượng đủ đúng để đánh giá lợi ích ở cấp hệ thống.
+- phương pháp đo năng lượng hai tầng, gồm macro-level cho công suất hệ thống và micro-level dual-MCU để bóc tách burst xử lý.
 
-Từ góc nhìn wearable health monitoring, đây là kết quả quan trọng nhất của giai đoạn hiện tại: hệ thống không hoạt động nặng mọi lúc, không hoạt động nhẹ mọi lúc, mà biết khi nào cần trả thêm chi phí tính toán để duy trì độ tin cậy của đầu ra và khi nào nên quay về chế độ tiết kiệm năng lượng.
+Điểm kết luận mạnh nhất của vòng thực nghiệm cuối là: **MLP INT8 không phải bottleneck năng lượng của hệ thống**. Với dữ liệu V7, mỗi lần `Invoke()` chỉ tiêu tốn khoảng `33-34 µJ`, tương đương khoảng `2.3-2.4%` năng lượng của một burst `HIGH`, trong khi phần còn lại chủ yếu thuộc về DSP/feature extraction và power tail. Điều này chứng minh hướng TinyML của đề tài là rất hiệu quả: mô hình đủ nhỏ để đưa AI vào node mà gần như không phá vỡ ngân sách năng lượng.
+
+Từ góc nhìn wearable health monitoring, đây là kết quả quan trọng nhất của giai đoạn hiện tại: hệ thống không hoạt động nặng mọi lúc, không hoạt động nhẹ mọi lúc, mà biết khi nào cần trả thêm chi phí tính toán để duy trì độ tin cậy của đầu ra và khi nào nên quay về chế độ tiết kiệm năng lượng. Khi đã cần vào `HIGH`, chi phí tăng thêm chủ yếu đến từ phần xử lý tín hiệu chứ không đến từ mô hình học máy.
 
 Xét trong ngữ cảnh báo cáo tiến độ đồ án tốt nghiệp, Phần B đồng thời đóng vai trò cầu nối từ phần prototype phần cứng ở Phần A sang phần đánh giá đóng góp của adaptive scheduling ở mức hệ thống. Nó chứng minh rằng bài toán của đề tài không chỉ dừng lại ở “đọc được cảm biến” hay “chạy được TinyML”, mà đã tiến tới mức thiết kế và kiểm chứng một cơ chế điều phối thích nghi có ý nghĩa thực nghiệm trên node thật.
